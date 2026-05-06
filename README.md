@@ -6,27 +6,54 @@
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────┐
-│                  HUMAN OVERSIGHT                    │
-│            (approve commits / merges)               │
-└──────────────────────┬──────────────────────────────┘
-                       │
-         ┌─────────────▼─────────────┐
-         │     LEAD AGENT (3090)     │
-         │  - Project planning       │
-         │  - Task decomposition     │
-         │  - Code review            │
-         │  - Architecture decisions │
-         └─────────────┬─────────────┘
-                       │  Task Queue (JSON)
-         ┌─────────────▼─────────────┐
-         │    JUNIOR AGENT (3060)    │
-         │  - Executes scoped tasks  │
-         │  - 1–3 file changes max   │
-         │  - Runs tests & linter    │
-         │  - Returns patch report   │
-         └───────────────────────────┘
+```mermaid
+graph TD
+    H["👤 Human Oversight\n(approve commits / merges)"]
+
+    H -->|"approves / rejects"| LA
+
+    subgraph Lead["🖥️ Lead Agent — RTX 3090"]
+        LA["Lead Agent\n• Project planning\n• Task decomposition\n• Code review\n• Architecture decisions"]
+    end
+
+    subgraph Junior["🖥️ Junior Agent — RTX 3060"]
+        JA["Junior Agent\n• Executes scoped tasks\n• 1–3 file changes max\n• Runs tests & linter\n• Returns patch report"]
+    end
+
+    LA -->|"task (JSON)\nscoped task with constraints"| JA
+    JA -->|"progress\nmid-task status update"| LA
+    JA -->|"patch_report\ndiff + test results + risks"| LA
+    LA -->|"review_result\napprove / reject + feedback"| JA
+
+    subgraph Tools["🛠️ Tools Layer"]
+        GT["git_tools.py\nSafe git operations"]
+        FT["file_tools.py\nRead / Write / Diff"]
+        TR["test_runner.py\npytest · ruff · mypy"]
+    end
+
+    JA --> GT
+    JA --> FT
+    JA --> TR
+
+    subgraph Transport["🔗 Transport"]
+        SSH["SSH Bridge\nparamiko"]
+        ORC["Orchestrator\nTask queue & coordination"]
+    end
+
+    LA <--> SSH
+    JA <--> SSH
+    ORC --> LA
+    ORC --> JA
+
+    subgraph Queue["📂 Task Queue"]
+        TODO["queue/tasks/todo/"]
+        WIP["queue/tasks/in_progress/"]
+        DONE["queue/tasks/done/"]
+    end
+
+    ORC --> TODO
+    TODO -->|"picked up"| WIP
+    WIP -->|"completed"| DONE
 ```
 
 ## Communication Protocol
@@ -34,11 +61,11 @@
 All inter-agent messages are typed JSON objects:
 
 | Message Type     | Direction          | Description                        |
-|------------------|--------------------|------------------------------------|
-| `task`           | Lead → Junior      | Scoped task with constraints       |
-| `progress`       | Junior → Lead      | Mid-task status update             |
-| `patch_report`   | Junior → Lead      | Diff + test results + risks        |
-| `review_result`  | Lead → Junior      | Approve / reject with feedback     |
+|------------------|--------------------|-------------------------------------|
+| `task`           | Lead → Junior      | Scoped task with constraints        |
+| `progress`       | Junior → Lead      | Mid-task status update              |
+| `patch_report`   | Junior → Lead      | Diff + test results + risks         |
+| `review_result`  | Lead → Junior      | Approve / reject with feedback      |
 
 ---
 
