@@ -1,0 +1,30 @@
+# DualMind Dev Configuration
+
+lead_agent:
+  host: localhost
+  model_endpoint: http://localhost:11434  # Ollama API
+  model_name: qwen2.5-coder:32b
+  gpu: RTX 3090
+
+junior_agent:
+  host: 192.168.1.100  # Second machine IP
+  ssh_user: agent
+  ssh_key: ~/.ssh/dualmind_rsa
+  model_endpoint: http://192.168.1.100:11434
+  model_name: qwen2.5-coder:7b
+  gpu: RTX 3060
+  sandbox_dir: /home/agent/sandbox
+
+repository:
+  path: /home/user/projects/my-project
+  main_branch: main
+  auto_commit: false   # ALWAYS keep false — human approves commits
+  auto_merge: false
+
+task_queue:
+  dir: ./queue/tasks
+  max_retries: 2
+
+logging:
+  level: INFO
+  file: ./logs/dualmind.log

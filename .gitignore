@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.env
+
+# Config (contains machine IPs and SSH keys)
+config.yaml
+
+# Logs
+logs/
+*.log
+
+# Tasks state
+queue/tasks/*.json
+
+# IDE
+.vscode/
+.idea/
