@@ -65,10 +65,12 @@ class CompanionClient:
             r = await c.post(f"{self.base}/fetch", json={"url": url})
             return r.json().get("content", "")
 
-    async def ast_signatures(self, path: str) -> str:
+    async def ast_signatures(self, source: str, language: str) -> str:
+        # source = file content as string (NOT a path)
+        # language = 'py', 'js', 'ts', 'rs', 'go', etc.
         async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.post(f"{self.base}/ast_signatures", json={"path": path})
-            return r.json().get("signatures", "")
+            r = await c.post(f"{self.base}/ast_signatures", json={"source": source, "language": language})
+            return r.json().get("outline", "")
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         async with httpx.AsyncClient(timeout=60) as c:
