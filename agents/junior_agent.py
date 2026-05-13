@@ -9,7 +9,7 @@ import httpx
 from core.protocol import Task, PatchReport, ProgressReport, TestResults
 from core.ssh_bridge import SSHBridge
 from tools.test_runner import run_checks
-from tools.git_tools import get_diff, create_branch, stage_changes
+import tools.git_tools as git_tools  # all functions are now async + take CompanionClient
 
 logger = logging.getLogger("dualmind.junior")
 
@@ -64,13 +64,14 @@ class JuniorAgent:
             "Implement the changes and explain what you did."
         )
 
-        # TODO: wire LLM output to actual file edits via tool calls
+        # TODO(step-5): wire LLM output to actual file edits via tool calls
         raw = await self._chat(prompt, system=system)
         logger.debug(f"Junior response: {raw[:200]}...")
 
-        # Run checks
+        # TODO(step-3): replace with async companion-based run_checks
         checks = run_checks(self.sandbox_dir)
-        diff = get_diff(self.sandbox_dir, task.branch)
+        # TODO(step-5): replace with await git_tools.get_diff(self.companion, ...)
+        diff = ""
 
         return PatchReport(
             task_id=task.id,
