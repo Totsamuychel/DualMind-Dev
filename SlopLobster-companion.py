@@ -2,6 +2,7 @@
 """SlopLobster Companion Server v1.4 — Shell + Git + Web Search for SlopLobster Agent."""
 import http.server, subprocess, json, os, sys, signal, platform, re, urllib.request, urllib.parse, urllib.error, shutil, threading, time
 from html.parser import HTMLParser
+from pathlib import Path
 
 try:
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
@@ -19,6 +20,45 @@ PORT = 8765
 DEFAULT_TIMEOUT = 60
 MAX_OUTPUT = 100000
 MAX_TIMEOUT = 600
+
+# ── DualMind task queue ───────────────────────────────────────────────────────
+# Paths are relative to cwd when the server starts (project root).
+_DM_QUEUE      = Path("queue/tasks")
+_DM_GOALS      = Path("queue/goals.txt")
+_DM_STATUS     = Path("queue/agents_status.json")
+_DM_WRITE_LOCK = threading.Lock()   # serialise all file writes
+
+_DM_STATUSES = ("todo", "in_progress", "done")
+
+
+def _dm_ensure_dirs():
+    for s in _DM_STATUSES:
+        (_DM_QUEUE / s).mkdir(parents=True, exist_ok=True)
+
+
+def _dm_load_tasks() -> dict:
+    """Return {todo: [...], in_progress: [...], done: [...]} from JSON files."""
+    _dm_ensure_dirs()
+    result = {}
+    for s in _DM_STATUSES:
+        tasks = []
+        for f in sorted((_DM_QUEUE / s).glob("*.json")):
+            try:
+                tasks.append(json.loads(f.read_text(encoding="utf-8")))
+            except Exception:
+                pass
+        result[s] = tasks
+    return result
+
+
+def _dm_find_task_file(task_id: str):
+    """Locate a task JSON file across all status folders. Returns Path or None."""
+    _dm_ensure_dirs()
+    for s in _DM_STATUSES:
+        p = _DM_QUEUE / s / f"{task_id}.json"
+        if p.exists():
+            return p
+    return None
 
 
 def kill_tree(pid):
@@ -910,6 +950,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "playwright": HAS_PLAYWRIGHT,
                 "browser_open": _pw_browser is not None and _pw_browser.is_connected()
             })
+
+        # ── DualMind endpoints ────────────────────────────────────────────────
+        elif self.path == "/tasks":
+            try:
+                self.send_json(200, _dm_load_tasks())
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif self.path == "/agents/status":
+            try:
+                if _DM_STATUS.exists():
+                    data = json.loads(_DM_STATUS.read_text(encoding="utf-8"))
+                else:
+                    data = {"lead": "idle", "junior": "idle", "note": "no status file yet"}
+                self.send_json(200, data)
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
         else:
             self.send_json(404, {"error": "not found"})
 
@@ -1291,6 +1349,77 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(200, {"ok": True, "killed": killed, "port": port})
             except Exception as e:
                 self.send_json(500, {"error": str(e)})    
+        # ── DualMind endpoints ────────────────────────────────────────────────
+
+        elif path == "/goal":
+            # Add a goal for the Lead agent.
+            # Body: {"goal": "Build a REST API for user auth"}
+            try:
+                body = self.read_body()
+                goal = body.get("goal", "").strip()
+                if not goal:
+                    return self.send_json(400, {"error": "goal must not be empty"})
+                with _DM_WRITE_LOCK:
+                    _DM_GOALS.parent.mkdir(parents=True, exist_ok=True)
+                    with _DM_GOALS.open("a", encoding="utf-8") as f:
+                        f.write(goal + "\n")
+                self.send_json(200, {"ok": True, "goal": goal})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif path.startswith("/approve/"):
+            # Human approves a task patch. Creates a <task_id>.approved sentinel file.
+            # Body: {} (empty — approval has no payload)
+            try:
+                task_id = path.removeprefix("/approve/").strip("/")
+                if not task_id:
+                    return self.send_json(400, {"error": "task_id missing"})
+                task_file = _dm_find_task_file(task_id)
+                if task_file is None:
+                    return self.send_json(404, {"error": f"task {task_id!r} not found"})
+                sentinel = _DM_QUEUE / "done" / f"{task_id}.approved"
+                with _DM_WRITE_LOCK:
+                    sentinel.parent.mkdir(parents=True, exist_ok=True)
+                    sentinel.touch()
+                self.send_json(200, {"ok": True, "task_id": task_id, "sentinel": str(sentinel)})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif path.startswith("/reject/"):
+            # Human rejects a task patch with an optional reason.
+            # Body: {"reason": "Tests still failing on edge case X"}
+            try:
+                task_id = path.removeprefix("/reject/").strip("/")
+                if not task_id:
+                    return self.send_json(400, {"error": "task_id missing"})
+                task_file = _dm_find_task_file(task_id)
+                if task_file is None:
+                    return self.send_json(404, {"error": f"task {task_id!r} not found"})
+                body = self.read_body()
+                reason = body.get("reason", "").strip()
+                sentinel = _DM_QUEUE / "done" / f"{task_id}.rejected"
+                with _DM_WRITE_LOCK:
+                    sentinel.parent.mkdir(parents=True, exist_ok=True)
+                    sentinel.write_text(reason, encoding="utf-8")
+                self.send_json(200, {"ok": True, "task_id": task_id, "reason": reason})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif path == "/agents/status":
+            # Orchestrator writes its own status; this POST lets it update the file.
+            # Body: {"lead": "reviewing", "junior": "executing", "task_id": "abc123"}
+            try:
+                body = self.read_body()
+                with _DM_WRITE_LOCK:
+                    _DM_STATUS.parent.mkdir(parents=True, exist_ok=True)
+                    _DM_STATUS.write_text(
+                        json.dumps(body, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                self.send_json(200, {"ok": True})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
         else:
             self.send_json(404, {"error": "not found"})
 

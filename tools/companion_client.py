@@ -411,3 +411,53 @@ class CompanionClient:
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.post(self._url("/dev_stop"), json={"port": port})
             return r.json()
+
+    # ── DualMind task queue ───────────────────────────────────────────────────
+
+    async def dm_get_tasks(self) -> dict:
+        """GET /tasks — return {todo, in_progress, done} lists of task dicts."""
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(self._url("/tasks"))
+            r.raise_for_status()
+            return r.json()
+
+    async def dm_add_goal(self, goal: str) -> dict:
+        """POST /goal — append a goal line to queue/goals.txt."""
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(self._url("/goal"), json={"goal": goal})
+            r.raise_for_status()
+            return r.json()
+
+    async def dm_approve(self, task_id: str) -> dict:
+        """POST /approve/<task_id> — human approves a patch; creates .approved sentinel."""
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(self._url(f"/approve/{task_id}"), json={})
+            r.raise_for_status()
+            return r.json()
+
+    async def dm_reject(self, task_id: str, reason: str = "") -> dict:
+        """POST /reject/<task_id> — human rejects a patch with optional reason."""
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(self._url(f"/reject/{task_id}"), json={"reason": reason})
+            r.raise_for_status()
+            return r.json()
+
+    async def dm_get_agents_status(self) -> dict:
+        """GET /agents/status — read current lead/junior state from status file."""
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(self._url("/agents/status"))
+            r.raise_for_status()
+            return r.json()
+
+    async def dm_update_agents_status(self, **fields) -> dict:
+        """POST /agents/status — orchestrator updates lead/junior state.
+
+        Example:
+            await companion.dm_update_agents_status(
+                lead="reviewing", junior="executing", task_id="abc123"
+            )
+        """
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(self._url("/agents/status"), json=fields)
+            r.raise_for_status()
+            return r.json()
