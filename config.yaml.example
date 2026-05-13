@@ -14,6 +14,7 @@ junior_agent:
   model_name: qwen2.5-coder:7b
   gpu: RTX 3060
   sandbox_dir: /home/agent/sandbox
+  companion_url: http://192.168.1.100:8765  # SlopLobster-companion.py on Junior machine
 
 repository:
   path: /home/user/projects/my-project
