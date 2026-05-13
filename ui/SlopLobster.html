@@ -4910,6 +4910,41 @@
       background: rgba(139,92,246,.1);
       border-color: rgba(139,92,246,.2);
     }
+
+    /* ── DualMind panel ─────────────────────────────────────────────────── */
+    .dm-panel { padding: 10px; display: flex; flex-direction: column; gap: 10px; overflow-y: auto; height: 100%; box-sizing: border-box; }
+    .dm-section { background: var(--bg-2); border: 1px solid var(--border); border-radius: 8px; padding: 10px; }
+    .dm-section-title { font-size: 10px; font-weight: 700; color: var(--tx-3); text-transform: uppercase; letter-spacing: .7px; margin-bottom: 8px; }
+    .dm-agents { display: flex; flex-direction: column; gap: 6px; }
+    .dm-agent { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--tx-1); }
+    .dm-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--tx-4); flex-shrink: 0; transition: background .3s; }
+    .dm-dot.idle { background: var(--tx-4); }
+    .dm-dot.busy { background: #f59e0b; animation: pulse 1.4s ease-in-out infinite; }
+    .dm-dot.done { background: #22c55e; }
+    .dm-state { margin-left: auto; font-size: 10px; color: var(--tx-3); font-family: 'JetBrains Mono', monospace; }
+    .dm-goal-textarea { width: 100%; box-sizing: border-box; background: var(--bg-1); border: 1px solid var(--border); color: var(--tx-0); border-radius: 6px; padding: 7px 9px; font-family: inherit; font-size: 12px; resize: vertical; margin-bottom: 8px; line-height: 1.5; }
+    .dm-goal-textarea:focus { outline: none; border-color: var(--accent); }
+    .dm-btn { border: none; border-radius: 6px; padding: 6px 12px; font-size: 12px; cursor: pointer; font-family: inherit; transition: opacity .15s; }
+    .dm-btn-primary { background: var(--accent); color: #fff; width: 100%; font-weight: 600; }
+    .dm-btn-primary:hover { opacity: .85; }
+    .dm-refresh-btn { background: none; border: none; cursor: pointer; color: var(--tx-3); font-size: 14px; padding: 0 2px; line-height: 1; }
+    .dm-refresh-btn:hover { color: var(--tx-0); }
+    .dm-task-list { display: flex; flex-direction: column; gap: 6px; }
+    .dm-empty { font-size: 12px; color: var(--tx-4); text-align: center; padding: 16px 0; }
+    .dm-task { background: var(--bg-1); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }
+    .dm-task-header { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; }
+    .dm-task-badge { font-size: 9px; padding: 2px 6px; border-radius: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .4px; flex-shrink: 0; }
+    .dm-task-badge.todo { background: var(--bg-3); color: var(--tx-3); }
+    .dm-task-badge.in_progress { background: rgba(245,158,11,.15); color: #f59e0b; }
+    .dm-task-badge.done { background: rgba(34,197,94,.15); color: #22c55e; }
+    .dm-task-title { font-size: 12px; font-weight: 600; color: var(--tx-0); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .dm-task-id { font-size: 10px; color: var(--tx-4); font-family: 'JetBrains Mono', monospace; flex-shrink: 0; }
+    .dm-task-branch { font-size: 10px; color: var(--tx-3); font-family: 'JetBrains Mono', monospace; margin-bottom: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .dm-task-actions { display: flex; gap: 6px; }
+    .dm-approve-btn { background: rgba(34,197,94,.15); color: #22c55e; border: 1px solid rgba(34,197,94,.3); flex: 1; }
+    .dm-approve-btn:hover { background: rgba(34,197,94,.3); }
+    .dm-reject-btn { background: rgba(239,68,68,.15); color: #ef4444; border: 1px solid rgba(239,68,68,.3); flex: 1; }
+    .dm-reject-btn:hover { background: rgba(239,68,68,.3); }
   </style>
 </head>
 
@@ -5038,7 +5073,7 @@
           <div class="welcome-inner">
             <div class="welcome-glyph">SlopLobster</div>
             <div class="welcome-h">Local AI Coding Agent</div>
-            <div class="welcome-sub">Connect to LM Studio, open a workspace, start the companion for full shell access
+            <div class="welcome-sub">Connect to Ollama (or LM Studio), open a workspace, start the companion for full shell access
             </div>
             <div class="welcome-divider"></div>
             <div id="welcome-status"></div>
@@ -5089,6 +5124,8 @@
             Term</button>
           <button class="rp-tab" data-tab="git" onclick="switchRpTab('git')"><i class="fas fa-code-branch"></i>
             Git</button>
+          <button class="rp-tab" data-tab="dualmind" onclick="switchRpTab('dualmind')"><i class="fas fa-brain"></i>
+            DualMind <span class="rp-tab-badge" id="rp-dm-badge" style="display:none">0</span></button>
         </div>
         <div class="rp-content">
           <div class="rp-pane active" id="rp-files">
@@ -5157,6 +5194,41 @@
               </div>
             </div>
           </div>
+
+          <div class="rp-pane" id="rp-dualmind">
+            <div class="dm-panel">
+              <div class="dm-section">
+                <div class="dm-section-title">Agents</div>
+                <div class="dm-agents">
+                  <div class="dm-agent">
+                    <span class="dm-dot idle" id="dm-lead-dot"></span>
+                    <span>Lead</span>
+                    <span class="dm-state" id="dm-lead-state">idle</span>
+                  </div>
+                  <div class="dm-agent">
+                    <span class="dm-dot idle" id="dm-junior-dot"></span>
+                    <span>Junior</span>
+                    <span class="dm-state" id="dm-junior-state">idle</span>
+                  </div>
+                </div>
+              </div>
+              <div class="dm-section">
+                <div class="dm-section-title">New Goal</div>
+                <textarea id="dm-goal-input" class="dm-goal-textarea" placeholder="Describe what you want built..." rows="3"></textarea>
+                <button class="dm-btn dm-btn-primary" onclick="dmSubmitGoal()">Send to Lead Agent</button>
+              </div>
+              <div class="dm-section">
+                <div class="dm-section-title" style="display:flex;justify-content:space-between;align-items:center">
+                  <span>Tasks</span>
+                  <button class="dm-refresh-btn" onclick="dmLoadTasks()" title="Refresh">↻</button>
+                </div>
+                <div id="dm-tasks" class="dm-task-list">
+                  <div class="dm-empty">Open this tab to load tasks</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
         </div>
       </aside>
     </div>
@@ -5205,10 +5277,11 @@
         <div class="field">
           <label>Backend</label>
           <select id="s-backend-type" style="background:var(--bg-2);border:1px solid var(--border);color:var(--tx-0);padding:4px 8px;border-radius:5px;font-size:12px;font-family:'JetBrains Mono',monospace;width:100%" onchange="onBackendTypeChange(this.value)">
+            <option value="ollama">Ollama</option>
             <option value="lmstudio">LM Studio</option>
             <option value="llamacpp">llama.cpp (server)</option>
           </select>
-          <div class="hint" id="s-backend-hint">LM Studio: full model load/unload support. Default port 1234.</div>
+          <div class="hint" id="s-backend-hint">Ollama: OpenAI-compatible API. Default port 11434.</div>
         </div>
         <div class="field" id="s-llamacpp-vision-field" style="display:none">
           <label>Vision / Multimodal</label>
@@ -5218,7 +5291,7 @@
           </div>
           <div class="hint">Check this if you started llama.cpp with <code style="background:var(--bg-3);padding:1px 4px;border-radius:3px">--mmproj</code>. Auto-detected via /props when connecting.</div>
         </div>
-        <div class="field"><label id="s-api-url-label">API URL</label><input id="s-api-url" value="http://localhost:1234"></div>
+        <div class="field"><label id="s-api-url-label">API URL</label><input id="s-api-url" value="http://localhost:11434"></div>
         <div class="field"><label>Companion Server URL</label><input id="s-comp-url" value="http://127.0.0.1:8765">
         </div>
         <div class="field"><label>Temperature</label>
@@ -6762,8 +6835,8 @@ if __name__ == "__main__":
     const modifiedFiles = new Set();
     const newFiles = new Set(); // tracks files created this session (yellow in tree)
     const state = {
-      apiUrl: 'http://localhost:1234', compUrl: 'http://127.0.0.1:8765',
-      backendType: 'lmstudio', // 'lmstudio' | 'llamacpp'
+      apiUrl: 'http://localhost:11434', compUrl: 'http://127.0.0.1:8765',
+      backendType: 'ollama', // 'ollama' | 'lmstudio' | 'llamacpp'
       isGitRepo: false,
       modelInfoMap: new Map(), // modelId -> {vision, contextLength, displayName, trainedForToolUse, architecture, paramsString}
       model: null, connected: false, compConnected: false, compInfo: null,
@@ -15611,14 +15684,20 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       const urlInp = document.getElementById('s-api-url');
       const modelLoadSection = document.querySelector('.modal [style*="Model Load Settings"]')?.closest('[style*="border-top"]');
       const visionField = document.getElementById('s-llamacpp-vision-field');
-      if (val === 'llamacpp') {
+      const _lmPorts = ['http://localhost:1234', 'http://localhost:8080', 'http://localhost:11434'];
+      if (val === 'ollama') {
+        if (hint) hint.textContent = 'Ollama: OpenAI-compatible /v1/chat/completions. Default port 11434.';
+        if (urlInp && _lmPorts.includes(urlInp.value)) urlInp.value = 'http://localhost:11434';
+        if (modelLoadSection) modelLoadSection.style.opacity = '0.4';
+        if (visionField) visionField.style.display = 'none';
+      } else if (val === 'llamacpp') {
         if (hint) hint.textContent = 'llama.cpp server: no model load/unload via API. Uses /v1/models & /v1/chat/completions. Default port 8080.';
-        if (urlInp && urlInp.value === 'http://localhost:1234') urlInp.value = 'http://localhost:8080';
+        if (urlInp && _lmPorts.includes(urlInp.value)) urlInp.value = 'http://localhost:8080';
         if (modelLoadSection) modelLoadSection.style.opacity = '0.4';
         if (visionField) visionField.style.display = '';
       } else {
         if (hint) hint.textContent = 'LM Studio: full model load/unload support. Default port 1234.';
-        if (urlInp && urlInp.value === 'http://localhost:8080') urlInp.value = 'http://localhost:1234';
+        if (urlInp && _lmPorts.includes(urlInp.value)) urlInp.value = 'http://localhost:1234';
         if (modelLoadSection) modelLoadSection.style.opacity = '';
         if (visionField) visionField.style.display = 'none';
       }
@@ -16857,6 +16936,7 @@ Format:
       document.querySelectorAll('.rp-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
       document.querySelectorAll('.rp-pane').forEach(p => p.classList.toggle('active', p.id === 'rp-' + name));
       if (name === 'git') updateGitPanel();
+      if (name === 'dualmind') { dmLoadTasks(); dmLoadAgentStatus(); }
     }
 
     function rpToggleChangeDiff(idx) {
@@ -18060,7 +18140,119 @@ Format:
       showToast(_swarmInputMode ? 'Swarm mode ON — agents will run in parallel' : 'Swarm mode OFF', 'info');
     }
 
+    // ── DualMind panel ────────────────────────────────────────────────────────
+    let _dmPollTimer = null;
+
+    function _dmEsc(s) {
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    async function dmLoadTasks() {
+      const container = document.getElementById('dm-tasks');
+      if (!container) return;
+      try {
+        const r = await fetch(`${state.compUrl}/tasks`);
+        if (!r.ok) throw new Error(r.status);
+        const data = await r.json();
+        _dmRenderTasks(data);
+      } catch {
+        container.innerHTML = '<div class="dm-empty">Companion offline — start SlopLobster-companion.py</div>';
+      }
+    }
+
+    async function dmLoadAgentStatus() {
+      try {
+        const r = await fetch(`${state.compUrl}/agents/status`);
+        if (!r.ok) return;
+        _dmUpdateDots(await r.json());
+      } catch {}
+    }
+
+    function _dmUpdateDots(data) {
+      const map = { idle: 'idle', waiting: 'busy', executing: 'busy', reviewing: 'busy', done: 'done' };
+      [['lead', 'dm-lead-dot', 'dm-lead-state'], ['junior', 'dm-junior-dot', 'dm-junior-state']].forEach(([key, dotId, labelId]) => {
+        const s = data[key] || 'idle';
+        const dot = document.getElementById(dotId);
+        const lbl = document.getElementById(labelId);
+        if (dot) dot.className = 'dm-dot ' + (map[s] || 'idle');
+        if (lbl) lbl.textContent = s;
+      });
+    }
+
+    function _dmRenderTasks(data) {
+      const all = [
+        ...(data.todo       || []).map(t => ({...t, _s: 'todo'})),
+        ...(data.in_progress|| []).map(t => ({...t, _s: 'in_progress'})),
+        ...(data.done       || []).map(t => ({...t, _s: 'done'})),
+      ];
+      const badge = document.getElementById('rp-dm-badge');
+      const pending = (data.todo||[]).length + (data.in_progress||[]).length;
+      if (badge) { badge.style.display = pending ? '' : 'none'; badge.textContent = pending; }
+      const container = document.getElementById('dm-tasks');
+      if (!all.length) { container.innerHTML = '<div class="dm-empty">No tasks yet</div>'; return; }
+      container.innerHTML = all.map(t => `
+        <div class="dm-task">
+          <div class="dm-task-header">
+            <span class="dm-task-badge ${_dmEsc(t._s)}">${_dmEsc(t._s.replace('_',' '))}</span>
+            <span class="dm-task-title" title="${_dmEsc(t.title||'')}">${_dmEsc(t.title||'(no title)')}</span>
+            <span class="dm-task-id">#${_dmEsc(t.id||'')}</span>
+          </div>
+          <div class="dm-task-branch"><i class="fas fa-code-branch" style="opacity:.4;margin-right:3px;font-size:9px"></i>${_dmEsc(t.branch||'')}</div>
+          ${t._s === 'done' ? `<div class="dm-task-actions">
+            <button class="dm-btn dm-approve-btn" onclick="dmApprove('${_dmEsc(t.id)}')"><i class="fas fa-check" style="margin-right:4px"></i>Approve</button>
+            <button class="dm-btn dm-reject-btn" onclick="dmReject('${_dmEsc(t.id)}')"><i class="fas fa-xmark" style="margin-right:4px"></i>Reject</button>
+          </div>` : ''}
+        </div>`).join('');
+    }
+
+    async function dmSubmitGoal() {
+      const inp = document.getElementById('dm-goal-input');
+      const goal = (inp?.value || '').trim();
+      if (!goal) return;
+      try {
+        const r = await fetch(`${state.compUrl}/goal`, {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({goal})
+        });
+        if (!r.ok) throw new Error(r.statusText);
+        inp.value = '';
+        showToast('Goal queued for Lead Agent', 'ok');
+        setTimeout(dmLoadTasks, 600);
+      } catch(e) { showToast('Could not send goal: ' + e.message, 'err'); }
+    }
+
+    async function dmApprove(taskId) {
+      if (!confirm(`Approve task #${taskId} and allow merge?`)) return;
+      try {
+        await fetch(`${state.compUrl}/approve/${taskId}`, {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+        showToast('Task approved — ready for git merge', 'ok');
+        dmLoadTasks();
+      } catch(e) { showToast('Error: ' + e.message, 'err'); }
+    }
+
+    async function dmReject(taskId) {
+      const reason = prompt('Reason for rejection (optional):') ?? '';
+      if (reason === null) return;
+      try {
+        await fetch(`${state.compUrl}/reject/${taskId}`, {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({reason})
+        });
+        showToast('Task rejected — Lead will retry', 'ok');
+        dmLoadTasks();
+      } catch(e) { showToast('Error: ' + e.message, 'err'); }
+    }
+
+    function _dmStartPolling() {
+      if (_dmPollTimer) clearInterval(_dmPollTimer);
+      _dmPollTimer = setInterval(() => {
+        if (rpState && rpState.activeTab === 'dualmind') { dmLoadTasks(); dmLoadAgentStatus(); }
+      }, 5000);
+    }
+    // ── end DualMind ─────────────────────────────────────────────────────────
+
     init();
+    _dmStartPolling();
 
   </script>
 </body>
