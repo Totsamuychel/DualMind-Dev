@@ -2,29 +2,54 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import uuid
-from typing import Any
+from pathlib import Path
 
 import httpx
 
-from core.protocol import Task, PatchReport, ReviewResult, TaskStatus
+from core.protocol import Task, PatchReport, ReviewResult
+from tools.companion_client import CompanionClient
 
 logger = logging.getLogger("dualmind.lead")
 
+_GOALS_FILE = Path("queue/goals.txt")
+
+# ── JSON extraction ───────────────────────────────────────────────────────────
+
+def _extract_json(text: str) -> str:
+    """Strip markdown fences and return the outermost JSON array or object."""
+    text = re.sub(r"```(?:json)?\s*", "", text).replace("```", "").strip()
+    for start_ch, end_ch in [("[", "]"), ("{", "}")]:
+        s = text.find(start_ch)
+        e = text.rfind(end_ch)
+        if s != -1 and e != -1 and e > s:
+            return text[s : e + 1]
+    return text
+
+
+# ── Agent ─────────────────────────────────────────────────────────────────────
 
 class LeadAgent:
-    """Runs on the high-end GPU machine (e.g. RTX 3090).
-    Responsible for: goal decomposition, task creation, code review.
+    """Runs on the high-end GPU machine (RTX 3090).
+
+    Responsible for: loading goals, web research, task decomposition,
+    code review with real LLM parsing.
     """
 
     def __init__(self, config: dict):
         self.endpoint = config["model_endpoint"]
         self.model = config["model_name"]
-        self.goals: list[str] = []  # Populated by human or loaded from file
+        self.companion = CompanionClient(
+            config.get("companion_url", "http://127.0.0.1:8765")
+        )
+        self.goals: list[str] = []
+
+    # ── LLM ──────────────────────────────────────────────────────────────────
 
     async def _chat(self, prompt: str, system: str = "") -> str:
-        """Send a prompt to the local Ollama endpoint."""
         async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(
                 f"{self.endpoint}/api/chat",
@@ -40,63 +65,204 @@ class LeadAgent:
             resp.raise_for_status()
             return resp.json()["message"]["content"]
 
+    # ── Goal loading ──────────────────────────────────────────────────────────
+
+    def load_goals_from_file(self) -> int:
+        """Read goals from queue/goals.txt (written by companion /goal endpoint).
+
+        Clears the file after reading so goals are not processed twice.
+        Returns the number of new goals loaded.
+        """
+        if not _GOALS_FILE.exists():
+            return 0
+        try:
+            text = _GOALS_FILE.read_text(encoding="utf-8")
+            _GOALS_FILE.write_text("", encoding="utf-8")  # clear atomically
+            new_goals = [l.strip() for l in text.splitlines() if l.strip()]
+            self.goals.extend(new_goals)
+            if new_goals:
+                logger.info("Loaded %d goal(s) from %s", len(new_goals), _GOALS_FILE)
+            return len(new_goals)
+        except OSError as exc:
+            logger.warning("Could not read goals file: %s", exc)
+            return 0
+
+    # ── Research ─────────────────────────────────────────────────────────────
+
+    async def _research(self, goal: str) -> str:
+        """Web-search the goal for context before decomposing.
+
+        Returns a bullet list of snippets, or empty string on failure.
+        """
+        try:
+            results = await self.companion.search(goal, num_results=3)
+            if not results:
+                return ""
+            lines = [f"- {r.title}: {r.snippet}" for r in results if r.snippet]
+            logger.info("Research found %d result(s) for goal", len(lines))
+            return "\n".join(lines)
+        except Exception as exc:
+            logger.debug("Research skipped (%s)", exc)
+            return ""
+
+    # ── Task decomposition ────────────────────────────────────────────────────
+
+    def _parse_tasks(self, raw: str, goal: str) -> list[Task]:
+        """Parse LLM JSON into Task objects with a stub fallback."""
+        try:
+            data = json.loads(_extract_json(raw))
+            if isinstance(data, dict):
+                data = [data]
+            tasks: list[Task] = []
+            for item in data:
+                if not isinstance(item, dict) or not item.get("title"):
+                    continue
+                tasks.append(
+                    Task(
+                        id=str(uuid.uuid4())[:8],
+                        title=item["title"],
+                        description=item.get("description", goal),
+                        files_in_scope=item.get("files_in_scope", []),
+                        constraints=item.get("constraints", []),
+                        acceptance_criteria=item.get(
+                            "acceptance_criteria",
+                            ["All tests pass", "Linter clean"],
+                        ),
+                        branch=item.get(
+                            "branch", f"feature/task-{str(uuid.uuid4())[:6]}"
+                        ),
+                    )
+                )
+            if tasks:
+                logger.info("Decomposed into %d task(s)", len(tasks))
+                return tasks
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+
+        logger.warning("Could not parse task JSON — using stub task")
+        return [
+            Task(
+                id=str(uuid.uuid4())[:8],
+                title=f"Implement: {goal[:60]}",
+                description=goal,
+                files_in_scope=[],
+                constraints=[],
+                acceptance_criteria=["All tests pass", "Linter clean"],
+                branch=f"feature/task-{str(uuid.uuid4())[:6]}",
+            )
+        ]
+
     async def decompose_next_goal(self) -> list[Task]:
-        """Break the next high-level goal into scoped tasks for Junior."""
+        """Research + decompose the next goal into scoped tasks for Junior."""
+        self.load_goals_from_file()
+
         if not self.goals:
-            logger.info("No goals queued. Waiting...")
+            logger.info("No goals queued — waiting")
             return []
 
         goal = self.goals.pop(0)
-        logger.info(f"Decomposing goal: {goal}")
+        logger.info("Decomposing goal: %s", goal)
+
+        research = await self._research(goal)
 
         system = (
             "You are a senior software architect. "
-            "Break the given goal into small, scoped coding tasks for a junior developer. "
-            "Each task should touch at most 3 files and have clear acceptance criteria. "
-            "Respond with a JSON array of tasks."
+            "Break the given goal into 1–5 small, scoped coding tasks for a junior developer. "
+            "Each task must touch at most 3 files and have clear acceptance criteria. "
+            "Reply with ONLY a JSON array — no markdown, no explanation:\n"
+            "[\n"
+            "  {\n"
+            '    "title": "short imperative title",\n'
+            '    "description": "detailed description",\n'
+            '    "files_in_scope": ["relative/path.py"],\n'
+            '    "constraints": ["no new dependencies"],\n'
+            '    "acceptance_criteria": ["all tests pass"],\n'
+            '    "branch": "feature/short-name"\n'
+            "  }\n"
+            "]"
         )
-        # TODO: parse LLM response into Task objects
-        raw = await self._chat(goal, system=system)
-        logger.debug(f"Lead decomposition raw: {raw[:200]}...")
 
-        # Placeholder: return single stub task
-        stub = Task(
-            id=str(uuid.uuid4())[:8],
-            title=f"Implement: {goal[:60]}",
-            description=goal,
-            files_in_scope=[],
-            acceptance_criteria=["All tests pass", "Linter clean"],
-            branch=f"feature/task-{str(uuid.uuid4())[:6]}",
+        prompt_parts = [f"Goal: {goal}"]
+        if research:
+            prompt_parts.append(f"\nResearch context:\n{research}")
+        prompt_parts.append(
+            "\nDecompose this goal into tasks following the schema above."
         )
-        return [stub]
+        prompt = "\n".join(prompt_parts)
+
+        raw = await self._chat(prompt, system=system)
+        logger.debug("Decomposition raw: %s", raw[:300])
+        return self._parse_tasks(raw, goal)
+
+    # ── Code review ───────────────────────────────────────────────────────────
+
+    def _parse_review(self, raw: str, task_id: str) -> ReviewResult:
+        """Parse LLM review JSON. Falls back to text heuristic on bad JSON."""
+        try:
+            data = json.loads(_extract_json(raw))
+            return ReviewResult(
+                task_id=task_id,
+                approved=bool(data.get("approved", False)),
+                feedback=str(data.get("feedback", raw[:400])),
+                requested_changes=list(data.get("requested_changes", [])),
+            )
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+
+        # Heuristic: look for approval / rejection keywords in plain text.
+        low = raw.lower()
+        approved = (
+            ("approved" in low or "looks good" in low or "lgtm" in low)
+            and "not approved" not in low
+            and "rejected" not in low
+            and "reject" not in low
+        )
+        logger.warning(
+            "Could not parse review JSON — heuristic: approved=%s", approved
+        )
+        return ReviewResult(
+            task_id=task_id,
+            approved=approved,
+            feedback=raw[:500],
+            requested_changes=[],
+        )
 
     async def review_patch(self, task: Task, patch: PatchReport) -> ReviewResult:
-        """Review a patch report and decide approve/reject."""
+        """Review a patch report and return an approve/reject decision."""
+        # Hard reject before calling the LLM — saves tokens and time.
         if not patch.test_results.passed or not patch.lint_passed:
+            failed = []
+            if not patch.test_results.passed:
+                failed.append("tests")
+            if not patch.lint_passed:
+                failed.append("linter")
             return ReviewResult(
                 task_id=task.id,
                 approved=False,
-                feedback="Tests or linter failed. Fix before resubmitting.",
+                feedback=f"{', '.join(failed).capitalize()} failed. Fix before resubmitting.",
                 requested_changes=[patch.test_results.summary],
             )
 
         system = (
             "You are a senior code reviewer. "
-            "Evaluate the diff and decide if it meets the acceptance criteria. "
-            "Reply with JSON: {approved: bool, feedback: str, requested_changes: list[str]}"
+            "Evaluate the diff below against the acceptance criteria. "
+            "Reply with ONLY a JSON object — no markdown, no explanation:\n"
+            '{"approved": true, '
+            '"feedback": "one concise paragraph", '
+            '"requested_changes": ["specific change if any"]}'
         )
+        diff_excerpt = patch.diff[:4000]
+        if len(patch.diff) > 4000:
+            diff_excerpt += "\n... [diff truncated]"
+
         prompt = (
             f"Task: {task.title}\n"
-            f"Criteria: {task.acceptance_criteria}\n"
-            f"Diff:\n{patch.diff[:3000]}\n"
-            f"Risks: {patch.risks}"
+            f"Acceptance criteria: {task.acceptance_criteria}\n"
+            f"Typecheck passed: {patch.typecheck_passed}\n"
+            f"Risks: {patch.risks or 'none'}\n\n"
+            f"Diff:\n{diff_excerpt}"
         )
-        raw = await self._chat(prompt, system=system)
-        logger.debug(f"Lead review raw: {raw[:200]}...")
 
-        # TODO: parse LLM response properly
-        return ReviewResult(
-            task_id=task.id,
-            approved=True,
-            feedback="Looks good. Ready for human merge.",
-        )
+        raw = await self._chat(prompt, system=system)
+        logger.debug("Review raw: %s", raw[:300])
+        return self._parse_review(raw, task.id)

@@ -5,6 +5,7 @@ lead_agent:
   model_endpoint: http://localhost:11434  # Ollama API
   model_name: qwen2.5-coder:32b
   gpu: RTX 3090
+  companion_url: http://localhost:8765    # SlopLobster-companion.py on Lead machine
 
 junior_agent:
   host: 192.168.1.100  # Second machine IP
