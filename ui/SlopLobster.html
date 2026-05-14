@@ -4940,6 +4940,7 @@
     .dm-task-title { font-size: 12px; font-weight: 600; color: var(--tx-0); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .dm-task-id { font-size: 10px; color: var(--tx-4); font-family: 'JetBrains Mono', monospace; flex-shrink: 0; }
     .dm-task-branch { font-size: 10px; color: var(--tx-3); font-family: 'JetBrains Mono', monospace; margin-bottom: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .dm-task-desc { font-size: 10px; color: var(--tx-3); margin-bottom: 6px; line-height: 1.5; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
     .dm-task-actions { display: flex; gap: 6px; }
     .dm-approve-btn { background: rgba(34,197,94,.15); color: #22c55e; border: 1px solid rgba(34,197,94,.3); flex: 1; }
     .dm-approve-btn:hover { background: rgba(34,197,94,.3); }
@@ -18190,19 +18191,24 @@ Format:
       if (badge) { badge.style.display = pending ? '' : 'none'; badge.textContent = pending; }
       const container = document.getElementById('dm-tasks');
       if (!all.length) { container.innerHTML = '<div class="dm-empty">No tasks yet</div>'; return; }
-      container.innerHTML = all.map(t => `
-        <div class="dm-task">
+      container.innerHTML = all.map(t => {
+        const desc = t.description ? `<div class="dm-task-desc">${_dmEsc(t.description)}</div>` : '';
+        const attempt = t.attempt > 0 ? ` · attempt ${t.attempt}` : '';
+        const branch = t.branch ? `<div class="dm-task-branch"><i class="fas fa-code-branch" style="opacity:.4;margin-right:3px;font-size:9px"></i>${_dmEsc(t.branch)}</div>` : '';
+        // Approve/Reject: in_progress = Lead approved, waiting for human review
+        const actions = t._s === 'in_progress' ? `<div class="dm-task-actions">
+            <button class="dm-btn dm-approve-btn" onclick="dmApprove('${_dmEsc(t.id)}')"><i class="fas fa-check" style="margin-right:4px"></i>Approve</button>
+            <button class="dm-btn dm-reject-btn" onclick="dmReject('${_dmEsc(t.id)}')"><i class="fas fa-xmark" style="margin-right:4px"></i>Reject</button>
+          </div>` : '';
+        return `<div class="dm-task">
           <div class="dm-task-header">
             <span class="dm-task-badge ${_dmEsc(t._s)}">${_dmEsc(t._s.replace('_',' '))}</span>
             <span class="dm-task-title" title="${_dmEsc(t.title||'')}">${_dmEsc(t.title||'(no title)')}</span>
-            <span class="dm-task-id">#${_dmEsc(t.id||'')}</span>
+            <span class="dm-task-id">#${_dmEsc(t.id||'')}${attempt}</span>
           </div>
-          <div class="dm-task-branch"><i class="fas fa-code-branch" style="opacity:.4;margin-right:3px;font-size:9px"></i>${_dmEsc(t.branch||'')}</div>
-          ${t._s === 'done' ? `<div class="dm-task-actions">
-            <button class="dm-btn dm-approve-btn" onclick="dmApprove('${_dmEsc(t.id)}')"><i class="fas fa-check" style="margin-right:4px"></i>Approve</button>
-            <button class="dm-btn dm-reject-btn" onclick="dmReject('${_dmEsc(t.id)}')"><i class="fas fa-xmark" style="margin-right:4px"></i>Reject</button>
-          </div>` : ''}
-        </div>`).join('');
+          ${branch}${desc}${actions}
+        </div>`;
+      }).join('');
     }
 
     async function dmSubmitGoal() {
