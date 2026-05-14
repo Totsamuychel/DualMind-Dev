@@ -461,3 +461,48 @@ class CompanionClient:
             r = await c.post(self._url("/agents/status"), json=fields)
             r.raise_for_status()
             return r.json()
+
+    async def dm_save_task(self, task_dict: dict) -> dict:
+        """POST /task — create or update a task JSON in the file queue.
+
+        task_dict must include 'id' and 'status' fields.  The companion places
+        the file in the correct status folder and moves it when status changes.
+        """
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(self._url("/task"), json=task_dict)
+            r.raise_for_status()
+            return r.json()
+
+    async def dm_check_approval(self, task_id: str) -> dict:
+        """GET /task/<id>/approval — poll human-approval sentinel files.
+
+        Returns {"status": "pending"|"approved"|"rejected", "reason": "..."}.
+        """
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(self._url(f"/task/{task_id}/approval"))
+            r.raise_for_status()
+            return r.json()
+
+    async def dm_push_notify(self, event: str, **kwargs) -> dict:
+        """POST /notify — push a lifecycle event into companion's notify queue.
+
+        The Telegram bot polls GET /notify/events to drain these.
+
+        event values: task_started | task_approved | task_rejected | system_idle
+        kwargs: task_id, title, reason, duration_minutes, ...
+        """
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(self._url("/notify"), json={"event": event, **kwargs})
+            r.raise_for_status()
+            return r.json()
+
+    async def dm_poll_notify(self) -> list[dict]:
+        """GET /notify/events — drain and return all pending lifecycle events.
+
+        Companion clears its queue on each call; caller is responsible for
+        processing every returned event.
+        """
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(self._url("/notify/events"))
+            r.raise_for_status()
+            return r.json().get("events", [])

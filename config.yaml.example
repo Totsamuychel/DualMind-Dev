@@ -1,32 +1,62 @@
 # DualMind Dev Configuration
+# Copy to config.yaml and fill in your values.
 
+# ── Lead Agent (high-end GPU machine) ────────────────────────────────────────
 lead_agent:
   host: localhost
-  model_endpoint: http://localhost:11434  # Ollama API
+  model_endpoint: http://localhost:11434   # Ollama API
   model_name: qwen2.5-coder:32b
   gpu: RTX 3090
-  companion_url: http://localhost:8765    # SlopLobster-companion.py on Lead machine
+  companion_url: http://localhost:8765     # SlopLobster-companion.py on Lead machine
 
+# ── Junior Agent (secondary GPU machine) ─────────────────────────────────────
 junior_agent:
-  host: 192.168.1.100  # Second machine IP
+  host: 192.168.1.100                      # Second machine IP
   ssh_user: agent
   ssh_key: ~/.ssh/dualmind_rsa
   model_endpoint: http://192.168.1.100:11434
   model_name: qwen2.5-coder:7b
   gpu: RTX 3060
-  sandbox_dir: /home/agent/sandbox
-  companion_url: http://192.168.1.100:8765  # SlopLobster-companion.py on Junior machine
+  sandbox_dir: /home/agent/sandbox         # Absolute path on the Junior machine
+  companion_url: http://192.168.1.100:8765 # SlopLobster-companion.py on Junior machine
 
+# ── Companion server (started automatically by main.py on Lead machine) ──────
+companion_server:
+  port: 8765          # Port to bind on localhost
+  autostart: true     # Set false to manage the companion process yourself
+
+# ── Repository ────────────────────────────────────────────────────────────────
 repository:
   path: /home/user/projects/my-project
   main_branch: main
-  auto_commit: false   # ALWAYS keep false — human approves commits
+  auto_commit: false  # ALWAYS keep false — human approves commits via UI
   auto_merge: false
 
+# ── Task queue ────────────────────────────────────────────────────────────────
 task_queue:
   dir: ./queue/tasks
-  max_retries: 2
+  max_retries: 2                # How many times Junior retries a Lead-rejected task
+  approval_timeout_minutes: 60  # Auto-reject if human doesn't respond within this long
 
+# ── Logging ───────────────────────────────────────────────────────────────────
 logging:
-  level: INFO
-  file: ./logs/dualmind.log
+  level: INFO         # DEBUG | INFO | WARNING | ERROR
+  file: ./logs/dualmind.log   # Leave empty to log to console only
+
+# ── Qdrant (RAG) ─────────────────────────────────────────────────────────────
+qdrant:
+  url: http://localhost:6333   # Qdrant REST API (run: docker run -p 6333:6333 qdrant/qdrant)
+  vector_dim: 384              # Must match the embedding model: all-MiniLM-L6-v2 → 384
+  api_key:                     # Leave empty for local/unauthenticated Qdrant
+
+# ── Telegram bot ──────────────────────────────────────────────────────────────
+telegram:
+  token: ""                    # BotFather token, leave empty to disable
+  allowed_users: []            # Telegram user IDs allowed to control the system
+  companion_url: http://localhost:8765
+  stuck_timeout_minutes: 30    # alert if Junior is stuck on a task this long
+  idle_timeout_minutes: 30     # alert if system has been idle this long
+
+# ── UI ────────────────────────────────────────────────────────────────────────
+# Open ui/SlopLobster.html in Chrome or Edge (requires File System Access API).
+# The DualMind tab in the right panel connects to companion_server.port above.

@@ -35,6 +35,7 @@ class Task(BaseModel):
     branch: str = Field(description="Git branch to work on")
     created_at: datetime = Field(default_factory=datetime.utcnow)
     status: TaskStatus = TaskStatus.TODO
+    attempt: int = 0  # incremented each time Lead rejects and orchestrator retries
 
 
 # ─── Junior → Lead ──────────────────────────────────────────────────────────

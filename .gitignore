@@ -16,7 +16,12 @@ logs/
 *.log
 
 # Tasks state
-queue/tasks/*.json
+queue/tasks/todo/
+queue/tasks/in_progress/
+queue/tasks/done/
+
+# RAG index cache
+.rag_cache.json
 
 # IDE
 .vscode/

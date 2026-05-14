@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 import uuid
 from pathlib import Path
+from typing import Optional
 
 import httpx
 
 from core.protocol import Task, PatchReport, ReviewResult
 from tools.companion_client import CompanionClient
+from tools.rag_store import RAGStore, COLLECTION_TASK_HISTORY
 
 logger = logging.getLogger("dualmind.lead")
 
@@ -39,13 +42,14 @@ class LeadAgent:
     code review with real LLM parsing.
     """
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, rag: Optional[RAGStore] = None):
         self.endpoint = config["model_endpoint"]
         self.model = config["model_name"]
         self.companion = CompanionClient(
             config.get("companion_url", "http://127.0.0.1:8765")
         )
         self.goals: list[str] = []
+        self.rag = rag
 
     # ── LLM ──────────────────────────────────────────────────────────────────
 
@@ -105,6 +109,90 @@ class LeadAgent:
             logger.debug("Research skipped (%s)", exc)
             return ""
 
+    # ── Task history (RAG) ────────────────────────────────────────────────────
+
+    async def _task_history_context(self, goal: str) -> str:
+        """Search past completed tasks for ones similar to the current goal.
+
+        Returns a compact bullet list injected into the decomposition prompt so
+        the LLM avoids re-decomposing work that was already done, and can learn
+        from how previous similar goals were broken down.
+
+        Returns an empty string when RAG is unavailable or finds nothing above
+        the similarity threshold.
+        """
+        if self.rag is None:
+            return ""
+        try:
+            hits = await self.rag.search(
+                self.companion,
+                goal,
+                COLLECTION_TASK_HISTORY,
+                top_k=3,
+                score_threshold=0.40,
+            )
+        except Exception as exc:
+            logger.debug("Task history lookup failed: %s", exc)
+            return ""
+
+        if not hits:
+            return ""
+
+        lines: list[str] = []
+        for hit in hits:
+            p = hit.payload
+            title = p.get("title", "?")
+            outcome = p.get("outcome", "?")
+            files = p.get("files_changed", [])
+            files_str = ", ".join(files[:3]) if files else "—"
+            if len(files) > 3:
+                files_str += f" (+{len(files) - 3} more)"
+            lines.append(f"- [{outcome}] \"{title}\" — {files_str}")
+
+        logger.debug("Task history: %d similar past task(s) found", len(lines))
+        return (
+            "Similar past tasks (avoid duplicating completed work):\n"
+            + "\n".join(lines)
+        )
+
+    async def record_task_outcome(
+        self,
+        task: Task,
+        patch: PatchReport,
+        outcome: str,
+    ) -> None:
+        """Persist a completed task into the task_history RAG collection.
+
+        Called by the orchestrator after final approve or reject so future
+        decompositions can see what has already been attempted.
+
+        outcome: "approved" | "rejected"
+        """
+        if self.rag is None:
+            return
+
+        embed_text = f"{task.title}: {task.description}"
+        payload = {
+            "task_id": task.id,
+            "title": task.title,
+            "description": task.description[:400],
+            "outcome": outcome,
+            "branch": patch.branch,
+            "files_changed": patch.files_changed,
+        }
+        try:
+            await self.rag.upsert(
+                self.companion,
+                [embed_text],
+                [payload],
+                COLLECTION_TASK_HISTORY,
+            )
+            logger.info(
+                "Task history: recorded [%s] %s → %s", task.id, outcome, task.title
+            )
+        except Exception as exc:
+            logger.warning("Task history: failed to record outcome: %s", exc)
+
     # ── Task decomposition ────────────────────────────────────────────────────
 
     def _parse_tasks(self, raw: str, goal: str) -> list[Task]:
@@ -163,7 +251,10 @@ class LeadAgent:
         goal = self.goals.pop(0)
         logger.info("Decomposing goal: %s", goal)
 
-        research = await self._research(goal)
+        research, history = await asyncio.gather(
+            self._research(goal),
+            self._task_history_context(goal),
+        )
 
         system = (
             "You are a senior software architect. "
@@ -183,6 +274,8 @@ class LeadAgent:
         )
 
         prompt_parts = [f"Goal: {goal}"]
+        if history:
+            prompt_parts.append(f"\n{history}")
         if research:
             prompt_parts.append(f"\nResearch context:\n{research}")
         prompt_parts.append(
