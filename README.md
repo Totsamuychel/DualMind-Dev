@@ -1,6 +1,6 @@
-# 🧠 DualMind Dev
+# DualMind Dev
 
-> A hierarchical multi-agent local LLM development system where two AI agents collaborate over a structured task protocol — a **Lead Agent** (senior, high-end GPU) and a **Junior Agent** (executor, secondary machine) — exchanging tasks, diffs, progress reports, and test results to autonomously build software projects with human oversight.
+> A hierarchical multi-agent local LLM development system. A **Lead Agent** plans and reviews; a **Junior Agent** executes scoped coding tasks. Both run on Ollama-served local models. A web UI lets you submit goals, watch the pipeline in real time, and approve or reject every patch before it lands.
 
 ---
 
@@ -8,122 +8,230 @@
 
 ```mermaid
 graph TD
-    H["👤 Human Oversight\n(approve commits / merges)"]
+    H["👤 Human\n(submit goals · approve / reject patches)"]
 
-    H -->|"approves / rejects"| LA
-
-    subgraph Lead["🖥️ Lead Agent — RTX 3090"]
-        LA["Lead Agent\n• Project planning\n• Task decomposition\n• Code review\n• Architecture decisions"]
+    subgraph UI["🌐 Web UI — http://127.0.0.1:8765"]
+        UIC["DualMind tab\n• Submit goals\n• Live task board\n• Approve / Reject buttons\n• Chat with any Ollama model"]
     end
 
-    subgraph Junior["🖥️ Junior Agent — RTX 3060"]
-        JA["Junior Agent\n• Executes scoped tasks\n• 1–3 file changes max\n• Runs tests & linter\n• Returns patch report"]
+    H -->|"goal text"| UIC
+    UIC -->|"POST /goal"| CS
+    H -->|"approve / reject"| UIC
+
+    subgraph Companion["🔧 Companion Server — SlopLobster-companion.py :8765"]
+        CS["HTTP API\n• Serves the Web UI\n• Shell execution\n• Git operations\n• Web search\n• SQLite DB"]
+        DB[("SQLite\ndata/dualmind.db\n• conversations\n• tasks")]
+        CS --- DB
     end
 
-    LA -->|"task (JSON)\nscoped task with constraints"| JA
-    JA -->|"progress\nmid-task status update"| LA
-    JA -->|"patch_report\ndiff + test results + risks"| LA
-    LA -->|"review_result\napprove / reject + feedback"| JA
-
-    subgraph Tools["🛠️ Tools Layer"]
-        GT["git_tools.py\nSafe git operations"]
-        FT["file_tools.py\nRead / Write / Diff"]
-        TR["test_runner.py\npytest · ruff · mypy"]
+    subgraph Orchestrator["⚙️ Orchestrator — core/orchestrator.py"]
+        ORC["Task queue · retry logic\ncrash recovery · human approval poll"]
     end
 
-    JA --> GT
-    JA --> FT
-    JA --> TR
-
-    subgraph Transport["🔗 Transport"]
-        SSH["SSH Bridge\nparamiko"]
-        ORC["Orchestrator\nTask queue & coordination"]
+    subgraph LeadAgent["🖥️ Lead Agent"]
+        LA["qwen3:32b (or any large model)\n• Decomposes goals → tasks\n• Web research context\n• RAG task history\n• Code review & approve/reject"]
     end
 
-    LA <--> SSH
-    JA <--> SSH
+    subgraph JuniorAgent["🖥️ Junior Agent"]
+        JA["qwen2.5-coder:7b (or any coder model)\n• Tool-call loop: read_file / write_file / execute\n• Writes feature branch\n• Runs pytest · ruff · mypy\n• Returns patch report"]
+    end
+
+    subgraph Tools["🛠️ Tools"]
+        GT["git_tools.py — branch · commit · diff"]
+        TR["test_runner.py — pytest · ruff · mypy"]
+        RAG["rag_store.py — Qdrant codebase search"]
+        IDX["indexer.py — repo chunker"]
+        CC["companion_client.py — async HTTP client"]
+    end
+
     ORC --> LA
     ORC --> JA
-
-    subgraph Queue["📂 Task Queue"]
-        TODO["queue/tasks/todo/"]
-        WIP["queue/tasks/in_progress/"]
-        DONE["queue/tasks/done/"]
-    end
-
-    ORC --> TODO
-    TODO -->|"picked up"| WIP
-    WIP -->|"completed"| DONE
+    LA -->|"Task JSON"| JA
+    JA -->|"PatchReport"| LA
+    LA -->|"ReviewResult"| ORC
+    ORC -->|"awaits sentinel"| CS
+    JA --> GT
+    JA --> TR
+    JA --> CC
+    LA --> RAG
+    JA --> RAG
+    RAG --> IDX
 ```
+
+---
 
 ## Communication Protocol
 
-All inter-agent messages are typed JSON objects:
+All inter-agent messages are typed Pydantic objects serialised to JSON:
 
-| Message Type     | Direction          | Description                        |
-|------------------|--------------------|-------------------------------------|
-| `task`           | Lead → Junior      | Scoped task with constraints        |
-| `progress`       | Junior → Lead      | Mid-task status update              |
-| `patch_report`   | Junior → Lead      | Diff + test results + risks         |
-| `review_result`  | Lead → Junior      | Approve / reject with feedback      |
+| Type | Direction | Fields |
+|------|-----------|--------|
+| `Task` | Lead → Junior | `id`, `title`, `description`, `files_in_scope`, `constraints`, `acceptance_criteria`, `branch` |
+| `ProgressReport` | Junior → Orchestrator | `task_id`, `iteration`, `files_written`, `note` |
+| `PatchReport` | Junior → Lead | `branch`, `diff`, `files_changed`, `test_results`, `lint_passed`, `typecheck_passed`, `risks` |
+| `ReviewResult` | Lead → Orchestrator | `task_id`, `approved`, `feedback`, `requested_changes` |
+
+---
+
+## Pipeline Flow
+
+```
+Human types goal in UI
+  → POST /goal → queue/goals.txt
+    → Lead: research + RAG history → decompose into Tasks
+      → Junior: tool-call loop (read / write / execute)
+        → pytest + ruff + mypy
+          → PatchReport to Lead
+            → Lead reviews diff
+              → approved? → UI shows "Pending Human Review"
+                → Human clicks Approve → status = done in SQLite
+                  → Orchestrator merges; records outcome in RAG
+              → rejected? → Junior retries with feedback (max 2 retries)
+```
 
 ---
 
 ## Project Structure
 
 ```
-dualmind-dev/
+DualMind-Dev/
 ├── agents/
-│   ├── lead_agent.py        # Lead agent logic
-│   └── junior_agent.py      # Junior agent logic
+│   ├── lead_agent.py          # Goal decomposition, research, code review
+│   └── junior_agent.py        # Tool-call loop, file I/O, quality checks
 ├── core/
-│   ├── orchestrator.py      # Task queue & coordination
-│   ├── protocol.py          # Message schemas (Pydantic)
-│   └── ssh_bridge.py        # SSH transport layer
+│   ├── orchestrator.py        # Task queue, retry logic, human approval poll
+│   ├── protocol.py            # Pydantic schemas (Task, PatchReport, …)
+│   └── ssh_bridge.py          # Optional SSH transport (use_ssh: false by default)
 ├── tools/
-│   ├── git_tools.py         # Safe git operations
-│   ├── file_tools.py        # Read/write/diff helpers
-│   └── test_runner.py       # pytest / ruff / mypy runner
-├── queue/
-│   └── tasks/               # JSON task files (todo/in_progress/done)
-├── config.yaml              # Machine addresses, model endpoints
-├── main.py                  # Entry point
+│   ├── companion_client.py    # Async HTTP client for companion server
+│   ├── git_tools.py           # Branch · stage · commit · diff (via companion)
+│   ├── test_runner.py         # pytest · ruff · mypy (via companion)
+│   ├── rag_store.py           # Qdrant vector search (optional)
+│   ├── indexer.py             # AST-aware repo chunker for RAG
+│   └── file_tools.py          # Low-level file helpers
+├── tg_bot/                    # Optional Telegram bot for remote approval
+│   ├── bot.py
+│   ├── notify.py
+│   └── monitor.py
+├── tests/                     # pytest test suite
+├── ui/
+│   └── SlopLobster.html       # Full-featured web UI (served by companion)
+├── SlopLobster-companion.py   # Companion server: shell, git, search, SQLite, serves UI
+├── config.yaml                # Your local config (gitignored)
+├── config.yaml.example        # Template
+├── main.py                    # Entry point — starts orchestrator + companion
 ├── requirements.txt
-└── README.md
+└── data/
+    └── dualmind.db            # SQLite: conversations + tasks (auto-created)
 ```
 
 ---
 
 ## Quickstart
 
+### 1. Install
+
 ```bash
-# 1. Clone and install
 git clone https://github.com/Totsamuychel/DualMind-Dev
 cd DualMind-Dev
 pip install -r requirements.txt
+```
 
-# 2. Configure machines
+### 2. Configure
+
+```bash
 cp config.yaml.example config.yaml
-# Edit config.yaml with your machine IPs and model endpoints
+```
 
-# 3. Run
+Edit `config.yaml`:
+
+```yaml
+lead_agent:
+  model_endpoint: http://localhost:11434   # Ollama on your main machine
+  model_name: qwen3:32b                    # or any large reasoning model
+
+junior_agent:
+  use_ssh: false                           # true if Junior is on a separate machine
+  model_endpoint: http://localhost:11434
+  model_name: qwen2.5-coder:7b            # or any coder model
+  sandbox_dir: ./sandbox
+
+qdrant:
+  url: ""                                  # leave empty to disable RAG
+```
+
+### 3. Start Ollama
+
+```bash
+# Required for CORS when the UI accesses Ollama directly
+OLLAMA_ORIGINS=* ollama serve
+ollama pull qwen3:32b
+ollama pull qwen2.5-coder:7b
+```
+
+### 4. Run
+
+```bash
 python main.py
 ```
 
-## Safety Rules
+Then open **http://127.0.0.1:8765/** in your browser.
 
-- ✅ Junior agent works **only in feature branches**, never main
-- ✅ All commits require **human approval** before merge
-- ✅ Junior agent has **read-only SSH** except for its sandbox dir
-- ✅ No autonomous `git push` to main or `git merge`
-- ✅ Every change validated by tests + linter before reporting back
+---
+
+## Using the UI
+
+| Action | How |
+|--------|-----|
+| Chat with a model | Select backend (Ollama / LM Studio / llama.cpp), pick a model, type |
+| Submit a goal to DualMind | Open the **DualMind** tab in the right panel → type goal → Send |
+| Watch the pipeline | Task board updates live every 3 s |
+| Approve a patch | Click **Approve** on a task card |
+| Reject with feedback | Click **Reject**, type reason |
+| Pin a model | Click the pin icon next to the model selector |
+| Disable tool calling | Click the tools toggle (for models that don't support it) |
+| File context | Open a file in the right panel — its content is injected into every message |
+
+---
+
+## Optional: RAG (Qdrant)
+
+```bash
+docker run -p 6333:6333 qdrant/qdrant
+```
+
+Set `qdrant.url: http://localhost:6333` in `config.yaml`. On first run the indexer walks the repository and populates the `codebase` collection. Junior and Lead get semantically relevant code snippets in every prompt.
+
+---
+
+## Optional: Telegram Bot
+
+Set `telegram.token` in `config.yaml`. The bot sends a message when a task is ready for human review, and accepts `/approve <id>` / `/reject <id>` commands.
+
+---
+
+## Safety
+
+- Junior always commits to a **feature branch**, never `main`
+- No automatic `git push` or `git merge` — all merges are manual
+- Blocked shell commands: `git push`, `git merge`, `git reset --hard`, `rm -rf`, `sudo`
+- Every patch validated by **pytest + ruff + mypy** before going to Lead review
+- Lead hard-rejects patches with failing tests or lint without calling the LLM
+- Human approve/reject is the final gate before any code lands
 
 ---
 
 ## Stack
 
-- **Models**: Any Ollama-compatible local LLM (Qwen2.5-Coder, DeepSeek-Coder, etc.)
-- **Transport**: SSH via `paramiko`
-- **Schema**: Pydantic v2
-- **Git ops**: GitPython
-- **Tests**: pytest + ruff + mypy
+| Layer | Tech |
+|-------|------|
+| Models | Ollama — any local LLM (`qwen3`, `qwen2.5-coder`, `deepseek-coder`, …) |
+| Schemas | Pydantic v2 |
+| HTTP client | httpx (async) |
+| Companion server | Python stdlib `http.server` |
+| Database | SQLite 3 (stdlib) |
+| Git | Shell via companion |
+| Quality checks | pytest · ruff · mypy |
+| RAG (optional) | Qdrant + `sentence-transformers` |
+| SSH (optional) | paramiko |
+| Telegram (optional) | python-telegram-bot |
