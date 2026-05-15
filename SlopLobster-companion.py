@@ -35,6 +35,12 @@ _DM_NOTIFY_QUEUE: deque = deque(maxlen=200)  # cap to prevent unbounded growth
 
 _DM_STATUSES = ("todo", "in_progress", "done")
 
+# ── Conversation persistence ──────────────────────────────────────────────────
+_CONV_DIR   = Path("data/conversations")
+_CONV_LOCK  = threading.Lock()
+
+def _conv_ensure_dir():
+    _CONV_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _dm_ensure_dirs():
@@ -1002,6 +1008,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
 
+        # ── Conversation persistence ──────────────────────────────────────────
+        elif self.path == "/conversations":
+            # GET /conversations — list all saved conversations (id, title, updated)
+            try:
+                _conv_ensure_dir()
+                convs = []
+                for f in sorted(_CONV_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+                    try:
+                        data = json.loads(f.read_text(encoding="utf-8"))
+                        convs.append({
+                            "id": data.get("id", f.stem),
+                            "title": data.get("title", "Untitled"),
+                            "updated": data.get("updated", ""),
+                            "message_count": len(data.get("messages", [])),
+                        })
+                    except Exception:
+                        pass
+                self.send_json(200, {"conversations": convs, "count": len(convs)})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif self.path.startswith("/conversations/"):
+            # GET /conversations/<id> — load full conversation
+            try:
+                conv_id = self.path.removeprefix("/conversations/").strip("/")
+                if not conv_id:
+                    return self.send_json(400, {"error": "id missing"})
+                _conv_ensure_dir()
+                f = _CONV_DIR / f"{conv_id}.json"
+                if not f.exists():
+                    return self.send_json(404, {"error": "not found"})
+                self.send_json(200, json.loads(f.read_text(encoding="utf-8")))
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
         else:
             self.send_json(404, {"error": "not found"})
 
@@ -1402,8 +1443,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(500, {"error": str(e)})
 
         elif path.startswith("/approve/"):
-            # Human approves a task patch. Creates a <task_id>.approved sentinel file.
-            # Body: {} (empty — approval has no payload)
+            # Human approves a task patch.
+            # Immediately moves the task JSON to done/ with status="done" so
+            # GET /tasks reflects the change right away (no orchestrator poll lag).
+            # Also creates the sentinel file so the orchestrator's polling loop
+            # can still detect the outcome.
             try:
                 task_id = path.removeprefix("/approve/").strip("/")
                 if not task_id:
@@ -1411,17 +1455,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 task_file = _dm_find_task_file(task_id)
                 if task_file is None:
                     return self.send_json(404, {"error": f"task {task_id!r} not found"})
-                sentinel = _DM_QUEUE / "done" / f"{task_id}.approved"
                 with _DM_WRITE_LOCK:
-                    sentinel.parent.mkdir(parents=True, exist_ok=True)
+                    _dm_ensure_dirs()
+                    # Update task JSON: set status=done, move to done/
+                    try:
+                        task_data = json.loads(task_file.read_text(encoding="utf-8"))
+                    except Exception:
+                        task_data = {"id": task_id}
+                    task_data["status"] = "done"
+                    new_path = _DM_QUEUE / "done" / f"{task_id}.json"
+                    new_path.write_text(json.dumps(task_data, ensure_ascii=False, indent=2), encoding="utf-8")
+                    if task_file != new_path:
+                        try: task_file.unlink()
+                        except OSError: pass
+                    # Sentinel for orchestrator polling compatibility
+                    sentinel = _DM_QUEUE / "done" / f"{task_id}.approved"
                     sentinel.touch()
-                self.send_json(200, {"ok": True, "task_id": task_id, "sentinel": str(sentinel)})
+                self.send_json(200, {"ok": True, "task_id": task_id, "status": "done"})
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
 
         elif path.startswith("/reject/"):
-            # Human rejects a task patch with an optional reason.
-            # Body: {"reason": "Tests still failing on edge case X"}
+            # Human rejects a task patch.
+            # Immediately moves the task JSON to done/ with status="rejected".
             try:
                 task_id = path.removeprefix("/reject/").strip("/")
                 if not task_id:
@@ -1431,11 +1487,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return self.send_json(404, {"error": f"task {task_id!r} not found"})
                 body = self.read_body()
                 reason = body.get("reason", "").strip()
-                sentinel = _DM_QUEUE / "done" / f"{task_id}.rejected"
                 with _DM_WRITE_LOCK:
-                    sentinel.parent.mkdir(parents=True, exist_ok=True)
+                    _dm_ensure_dirs()
+                    try:
+                        task_data = json.loads(task_file.read_text(encoding="utf-8"))
+                    except Exception:
+                        task_data = {"id": task_id}
+                    task_data["status"] = "rejected"
+                    if reason:
+                        task_data["reject_reason"] = reason
+                    new_path = _DM_QUEUE / "done" / f"{task_id}.json"
+                    new_path.write_text(json.dumps(task_data, ensure_ascii=False, indent=2), encoding="utf-8")
+                    if task_file != new_path:
+                        try: task_file.unlink()
+                        except OSError: pass
+                    # Sentinel for orchestrator polling compatibility
+                    sentinel = _DM_QUEUE / "done" / f"{task_id}.rejected"
                     sentinel.write_text(reason, encoding="utf-8")
-                self.send_json(200, {"ok": True, "task_id": task_id, "reason": reason})
+                self.send_json(200, {"ok": True, "task_id": task_id, "status": "rejected", "reason": reason})
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
 
@@ -1496,6 +1565,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     _DM_NOTIFY_QUEUE.append(body)
                     queued = len(_DM_NOTIFY_QUEUE)
                 self.send_json(200, {"ok": True, "queued": queued})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        # ── Conversation save/delete ──────────────────────────────────────────
+        elif path == "/conversations":
+            # POST /conversations — upsert a conversation (body = full conversation JSON)
+            try:
+                body = self.read_body()
+                conv_id = str(body.get("id", "")).strip()
+                if not conv_id:
+                    return self.send_json(400, {"error": "id required"})
+                _conv_ensure_dir()
+                f = _CONV_DIR / f"{conv_id}.json"
+                with _CONV_LOCK:
+                    f.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+                self.send_json(200, {"ok": True, "id": conv_id})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif path.startswith("/conversations/"):
+            # POST /conversations/<id>/delete — delete a conversation
+            conv_id = path.removeprefix("/conversations/").strip("/").removesuffix("/delete")
+            try:
+                _conv_ensure_dir()
+                f = _CONV_DIR / f"{conv_id}.json"
+                with _CONV_LOCK:
+                    if f.exists():
+                        f.unlink()
+                self.send_json(200, {"ok": True, "id": conv_id})
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
 

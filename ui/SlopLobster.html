@@ -6,7 +6,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SlopLobster</title>
+  <title>DualMind</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link
     href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap"
@@ -15281,6 +15281,30 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       }
       try { saveConversations(); renderConvList(); }
       catch (e) { console.error('[conv] save failed:', e); }
+      // Also persist to companion server (server-side DB backup)
+      _saveConvToServer(c);
+    }
+
+    function _saveConvToServer(conv) {
+      if (!state.compConnected) return;
+      try {
+        const payload = {
+          id: conv.id,
+          title: conv.title || 'Untitled',
+          created: conv.created,
+          updated: conv.updated,
+          messages: (conv.messages || []).map(m => {
+            const clean = { ...m };
+            delete clean._diff; delete clean._searchData; delete clean._images;
+            return clean;
+          }),
+        };
+        fetch(`${state.compUrl}/conversations`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        }).catch(() => {}); // fire-and-forget, never block UI
+      } catch {}
     }
 
     async function doNewConversation() {
@@ -18225,6 +18249,8 @@ Format:
 
     // ── DualMind panel ────────────────────────────────────────────────────────
     let _dmPollTimer = null;
+    // Optimistic overrides: taskId → 'done'|'rejected' until server confirms
+    const _dmOptimistic = {};
 
     function _dmEsc(s) {
       return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -18237,6 +18263,14 @@ Format:
         const r = await fetch(`${state.compUrl}/tasks`);
         if (!r.ok) throw new Error(r.status);
         const data = await r.json();
+        // Clear optimistic overrides for tasks that server already confirmed
+        const allIds = new Set([
+          ...(data.todo||[]), ...(data.in_progress||[]), ...(data.done||[])
+        ].map(t => t.id));
+        for (const id of Object.keys(_dmOptimistic)) {
+          const serverTask = (data.done||[]).find(t => t.id === id);
+          if (serverTask) delete _dmOptimistic[id]; // server confirmed, clear override
+        }
         _dmRenderTasks(data);
       } catch {
         container.innerHTML = '<div class="dm-empty">Companion offline — start SlopLobster-companion.py</div>';
@@ -18263,32 +18297,45 @@ Format:
     }
 
     function _dmRenderTasks(data) {
-      const all = [
-        ...(data.todo       || []).map(t => ({...t, _s: 'todo'})),
-        ...(data.in_progress|| []).map(t => ({...t, _s: 'in_progress'})),
-        ...(data.done       || []).map(t => ({...t, _s: 'done'})),
-      ];
+      // Apply optimistic overrides: move tasks to done visually before server confirms
+      let todo       = (data.todo        || []).map(t => ({...t, _s: 'todo'}));
+      let inProgress = (data.in_progress || []).map(t => ({...t, _s: _dmOptimistic[t.id] || 'in_progress'}));
+      let done       = (data.done        || []).map(t => ({...t, _s: t.status || 'done'}));
+
+      // Tasks with optimistic overrides: show as done, not in_progress
+      const optimisticDone = inProgress.filter(t => _dmOptimistic[t.id]);
+      inProgress = inProgress.filter(t => !_dmOptimistic[t.id]);
+      done = [...optimisticDone, ...done];
+
+      const all = [...todo, ...inProgress, ...done];
+
       const badge = document.getElementById('rp-dm-badge');
-      const pending = (data.todo||[]).length + (data.in_progress||[]).length;
+      const pending = todo.length + inProgress.length;
       if (badge) { badge.style.display = pending ? '' : 'none'; badge.textContent = pending; }
+
       const container = document.getElementById('dm-tasks');
       if (!all.length) { container.innerHTML = '<div class="dm-empty">No tasks yet</div>'; return; }
       container.innerHTML = all.map(t => {
+        const statusLabel = {
+          todo: 'todo', in_progress: 'in progress',
+          done: 'done', rejected: 'rejected'
+        }[t._s] || t._s.replace('_', ' ');
         const desc = t.description ? `<div class="dm-task-desc">${_dmEsc(t.description)}</div>` : '';
         const attempt = t.attempt > 0 ? ` · attempt ${t.attempt}` : '';
         const branch = t.branch ? `<div class="dm-task-branch"><i class="fas fa-code-branch" style="opacity:.4;margin-right:3px;font-size:9px"></i>${_dmEsc(t.branch)}</div>` : '';
-        // Approve/Reject: in_progress = Lead approved, waiting for human review
+        const rejectReason = t.reject_reason ? `<div class="dm-task-desc" style="color:var(--err,#f55)">↩ ${_dmEsc(t.reject_reason)}</div>` : '';
+        // Show Approve/Reject only for in_progress tasks not yet optimistically updated
         const actions = t._s === 'in_progress' ? `<div class="dm-task-actions">
             <button class="dm-btn dm-approve-btn" onclick="dmApprove('${_dmEsc(t.id)}')"><i class="fas fa-check" style="margin-right:4px"></i>Approve</button>
             <button class="dm-btn dm-reject-btn" onclick="dmReject('${_dmEsc(t.id)}')"><i class="fas fa-xmark" style="margin-right:4px"></i>Reject</button>
           </div>` : '';
         return `<div class="dm-task">
           <div class="dm-task-header">
-            <span class="dm-task-badge ${_dmEsc(t._s)}">${_dmEsc(t._s.replace('_',' '))}</span>
+            <span class="dm-task-badge ${_dmEsc(t._s)}">${_dmEsc(statusLabel)}</span>
             <span class="dm-task-title" title="${_dmEsc(t.title||'')}">${_dmEsc(t.title||'(no title)')}</span>
             <span class="dm-task-id">#${_dmEsc(t.id||'')}${attempt}</span>
           </div>
-          ${branch}${desc}${actions}
+          ${branch}${desc}${rejectReason}${actions}
         </div>`;
       }).join('');
     }
@@ -18310,32 +18357,52 @@ Format:
     }
 
     async function dmApprove(taskId) {
-      if (!confirm(`Approve task #${taskId} and allow merge?`)) return;
+      if (!confirm(`Approve task #${taskId}?`)) return;
+      // Optimistic update: show as done immediately
+      _dmOptimistic[taskId] = 'done';
+      dmLoadTasks();
       try {
-        await fetch(`${state.compUrl}/approve/${taskId}`, {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
-        showToast('Task approved — ready for git merge', 'ok');
+        const r = await fetch(`${state.compUrl}/approve/${taskId}`, {
+          method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}'
+        });
+        if (!r.ok) throw new Error((await r.json().catch(()=>({}))).error || r.status);
+        showToast('Task approved ✓', 'ok');
+      } catch(e) {
+        delete _dmOptimistic[taskId]; // rollback on error
+        showToast('Approve failed: ' + e.message, 'err');
         dmLoadTasks();
-      } catch(e) { showToast('Error: ' + e.message, 'err'); }
+      }
     }
 
     async function dmReject(taskId) {
-      const reason = prompt('Reason for rejection (optional):') ?? '';
-      if (reason === null) return;
+      const reason = prompt('Reason for rejection (optional):');
+      if (reason === null) return; // user cancelled
+      // Optimistic update
+      _dmOptimistic[taskId] = 'rejected';
+      dmLoadTasks();
       try {
-        await fetch(`${state.compUrl}/reject/${taskId}`, {
-          method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({reason})
+        const r = await fetch(`${state.compUrl}/reject/${taskId}`, {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({reason: reason || ''})
         });
+        if (!r.ok) throw new Error((await r.json().catch(()=>({}))).error || r.status);
         showToast('Task rejected — Lead will retry', 'ok');
+      } catch(e) {
+        delete _dmOptimistic[taskId]; // rollback on error
+        showToast('Reject failed: ' + e.message, 'err');
         dmLoadTasks();
-      } catch(e) { showToast('Error: ' + e.message, 'err'); }
+      }
     }
 
     function _dmStartPolling() {
       if (_dmPollTimer) clearInterval(_dmPollTimer);
+      // Poll every 3s when DualMind tab is active, 10s otherwise
       _dmPollTimer = setInterval(() => {
-        if (rpState && rpState.activeTab === 'dualmind') { dmLoadTasks(); dmLoadAgentStatus(); }
-      }, 5000);
+        if (rpState && rpState.activeTab === 'dualmind') {
+          dmLoadTasks();
+          dmLoadAgentStatus();
+        }
+      }, 3000);
     }
     // ── end DualMind ─────────────────────────────────────────────────────────
 
