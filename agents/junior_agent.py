@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from core.protocol import Task, PatchReport, TestResults
+from core.protocol import Task, PatchReport, TestResults, ProgressReport
 from core.ssh_bridge import SSHBridge
 from tools.companion_client import CompanionClient
 from tools.rag_store import RAGStore, COLLECTION_CODEBASE, COLLECTION_ERRORS
@@ -138,7 +138,14 @@ class JuniorAgent:
     def __init__(self, config: dict, rag: Optional[RAGStore] = None):
         self.endpoint = config["model_endpoint"]
         self.model = config["model_name"]
-        self.sandbox_dir = config["sandbox_dir"]
+        
+        # Use repository.path as a default if sandbox_dir is missing.
+        # Note: repository section is at top-level, so config might not have it
+        # depending on how Orchestrator passed it.  main.py passes the full cfg.
+        self.sandbox_dir = config.get("sandbox_dir") or config.get("repository", {}).get("path")
+        if not self.sandbox_dir:
+            raise ValueError("JuniorAgent: 'sandbox_dir' or 'repository.path' must be set")
+
         self.companion_url = config.get("companion_url", "http://127.0.0.1:8765")
         
         self.ssh = SSHBridge(
@@ -187,12 +194,45 @@ class JuniorAgent:
                 },
             )
             resp.raise_for_status()
-            return resp.json()["message"]
+            message = resp.json()["message"]
+
+        # Some models (e.g. qwen2.5-coder) output tool calls as JSON text in
+        # content instead of the structured tool_calls field.  Normalise.
+        if not message.get("tool_calls"):
+            content = message.get("content", "").strip()
+            if content:
+                # Strip optional markdown fences: ```json ... ``` or ``` ... ```
+                if content.startswith("```"):
+                    lines = content.splitlines()
+                    inner = lines[1:-1] if lines and lines[-1].strip() == "```" else lines[1:]
+                    content = "\n".join(inner).strip()
+                try:
+                    parsed = json.loads(content)
+                    if isinstance(parsed, dict) and "name" in parsed and "arguments" in parsed:
+                        message = {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {"function": {"name": parsed["name"], "arguments": parsed["arguments"]}}
+                            ],
+                        }
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+        return message
 
     # ── Remote file I/O ───────────────────────────────────────────────────────
 
     def _abs(self, relative: str) -> str:
-        return str(Path(self.sandbox_dir) / relative)
+        sandbox = Path(self.sandbox_dir)
+        p = Path(relative)
+        # Strip leading sandbox_dir prefix when the LLM already includes it
+        # (e.g. "sandbox/hello.py" → "hello.py" so we don't nest twice).
+        try:
+            p = p.relative_to(sandbox)
+        except ValueError:
+            pass
+        return str(sandbox / p)
 
     async def _read_remote(self, abs_path: str) -> str:
         result = await self.companion.execute(f"cat '{abs_path}'")
@@ -456,10 +496,11 @@ class JuniorAgent:
     ) -> list[dict]:
         system = (
             "You are a junior software developer executing a scoped coding task. "
-            "Use read_file to understand existing code before editing. "
-            "Use write_file to apply your changes (only files in files_in_scope). "
-            "Use execute for introspection (grep, ls, python -c, git status). "
-            "When finished, reply with plain text summarising what you changed and why."
+            "You MUST call tools to perform actions — never just describe what you would do. "
+            "Call write_file NOW to create or edit files. Call read_file to inspect existing code. "
+            "Call execute for shell commands (grep, ls, python -c, git status). "
+            "Use paths RELATIVE to the sandbox root (e.g. 'hello.py', not 'sandbox/hello.py'). "
+            "After all tool calls are done, reply with plain text summarising what you changed."
         )
         user_parts: list[str] = []
 
@@ -486,7 +527,11 @@ class JuniorAgent:
             user_parts += ["", error_context]
         if rag_context:
             user_parts += ["", rag_context]
-        user_parts += ["", "Read the relevant files, implement the changes, then summarise."]
+        user_parts += [
+            "",
+            "IMPORTANT: Use the write_file tool immediately to create or modify the required files.",
+            "Do not describe the solution in text — call write_file with the actual file content.",
+        ]
 
         return [
             {"role": "system", "content": system},

@@ -54,7 +54,7 @@ class LeadAgent:
     # ── LLM ──────────────────────────────────────────────────────────────────
 
     async def _chat(self, prompt: str, system: str = "") -> str:
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=600) as client:
             resp = await client.post(
                 f"{self.endpoint}/api/chat",
                 json={

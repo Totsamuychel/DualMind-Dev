@@ -65,13 +65,14 @@ async def run_checks(
         r = await companion.execute(
             "python -m pytest --tb=short -q", cwd=sandbox_dir
         )
-        tests_ok = r.ok
+        # Exit code 5 = no tests collected — treat as pass (empty sandbox is fine).
+        tests_ok = r.ok or r.exit_code == 5
         tests_out = r.output[:OUTPUT_LIMIT]
         if not tests_ok:
             errors.append("pytest")
 
     if run_lint:
-        r = await companion.execute("ruff check .", cwd=sandbox_dir)
+        r = await companion.execute("python -m ruff check .", cwd=sandbox_dir)
         lint_ok = r.ok
         lint_out = r.output[:OUTPUT_LIMIT]
         if not lint_ok:
@@ -79,7 +80,7 @@ async def run_checks(
 
     if run_typecheck:
         r = await companion.execute(
-            "mypy . --ignore-missing-imports", cwd=sandbox_dir
+            "python -m mypy . --ignore-missing-imports", cwd=sandbox_dir
         )
         type_ok = r.ok
         type_out = r.output[:OUTPUT_LIMIT]

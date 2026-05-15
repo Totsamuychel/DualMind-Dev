@@ -1,3 +1,5 @@
+
+
 <!DOCTYPE html>
 <html lang="en">
 
@@ -188,6 +190,10 @@
       color: var(--tx-0);
       border-color: var(--border-l)
     }
+
+    #model-pin-btn { transition: color 0.15s, transform 0.15s; }
+    #model-pin-btn.active { color: var(--accent); transform: rotate(-45deg); }
+    #tools-toggle-btn.disabled { color: var(--tx-4); opacity: 0.45; }
 
     .model-sel {
       background: var(--bg-2);
@@ -5003,6 +5009,12 @@
       <button class="hdr-btn" id="model-load-btn" onclick="manualModelLoad()"
         title="Load this model in LM Studio (unloads current)" style="display:none"><i
           class="fas fa-download"></i></button>
+      <button class="hdr-btn" id="model-pin-btn" onclick="toggleModelPin()" title="Pin selected model (persists across refresh)">
+        <i class="fas fa-thumbtack"></i>
+      </button>
+      <button class="hdr-btn" id="tools-toggle-btn" onclick="toggleToolsDisabled()" title="Toggle tool calling on/off">
+        <i class="fas fa-tools"></i>
+      </button>
       <span id="model-meta"
         style="font-size:9px;color:var(--tx-4);font-family:'JetBrains Mono',monospace;white-space:nowrap"></span>
       <div class="hdr-sep"></div>
@@ -6877,7 +6889,9 @@ if __name__ == "__main__":
       projectType: null, projectMeta: null,
       browserAvailable: false,
       convSearchQuery: '',
-      devServer: null  // { port, command, pollInterval, ready }
+      devServer: null,  // { port, command, pollInterval, ready }
+      pinnedModel: null,
+      toolsDisabled: false
     };
 
     const inputHistory = [];
@@ -7778,6 +7792,7 @@ Python command: {{PYTHON_CMD}}`;
 
     /* ═══════════════ TOOL DEFINITIONS ═══════════════ */
     function getToolDefs() {
+      if (state.toolsDisabled) return [];
       const tools = [
         { type: 'function', function: { name: 'think', description: 'Think through a problem step by step before acting. Visible to user.', parameters: { type: 'object', properties: { thought: { type: 'string', description: 'Your reasoning and plan' } }, required: ['thought'] } } },
         { type: 'function', function: { name: 'read_file', description: 'Read a file as text. For PDF files, text is automatically extracted. For raster image files (PNG, JPG, GIF, WebP, BMP, ICO marked [IMAGE] in list_directory), the image is sent to you visually. For SVG files, returns the raw XML markup as text — use view_image to see the rendered graphic instead.', parameters: { type: 'object', properties: { path: { type: 'string', description: 'Relative path to file or image' } }, required: ['path'] } } },
@@ -11026,9 +11041,9 @@ Python command: {{PYTHON_CMD}}`;
     }
 
     async function testConnection(retry = 3) {
-          const backendLabel = state.backendType === 'llamacpp' ? 'llama.cpp' : 'LM Studio';
+          const backendLabel = state.backendType === 'ollama' ? 'Ollama' : state.backendType === 'llamacpp' ? 'llama.cpp' : 'LM Studio';
           try {
-            // ── Pre-flight: check /v1/models (supported by both LM Studio and llama.cpp) ──
+            // ── Pre-flight: check /v1/models (supported by Ollama, LM Studio and llama.cpp) ──
             const testRes = await fetch(`${state.apiUrl}/v1/models`, {
               signal: AbortSignal.timeout(3000)
             });
@@ -11038,11 +11053,11 @@ Python command: {{PYTHON_CMD}}`;
               let hint = '';
 
               if (state.backendType === 'lmstudio') {
-                if (status === 500) {
-                  hint = '\n\n→ Open LM Studio, check the console for errors, restart the model, then try again.';
-                } else if (status === 503) {
-                  hint = '\n→ LM Studio is busy or restarting. Wait a moment and try again.';
-                }
+                if (status === 500) hint = '\n\n→ Open LM Studio, check the console for errors, restart the model, then try again.';
+                else if (status === 503) hint = '\n→ LM Studio is busy or restarting. Wait a moment and try again.';
+              } else if (state.backendType === 'ollama') {
+                if (status === 500) hint = '\n→ Ollama server error — check your Ollama console.';
+                else if (status === 503) hint = '\n→ Ollama unavailable. Is it running?';
               } else {
                 if (status === 500) hint = '\n→ llama.cpp server error — check your server console.';
                 else if (status === 503) hint = '\n→ llama.cpp server unavailable. Is it running?';
@@ -11088,6 +11103,8 @@ Python command: {{PYTHON_CMD}}`;
               } else {
                 showToast(`Loaded: ${activeInstance.identifier.split('/').pop()} — selector shows different model`, 'warn');
               }
+            } else if (state.backendType === 'ollama') {
+              showToast(`Connected to Ollama (${count} model${count !== 1 ? 's' : ''})`, 'ok');
             } else {
               // llama.cpp: probe /props for vision, then show connected toast
               probeLlamaCppVision().then(() => {
@@ -11309,7 +11326,13 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       const _isQwen = isQwen();
       const _isGemma = isGemma();
       // Always use full system prompt — Gemma/Qwen thinking is handled via chat template, not system content
-      const sysContent = state._sysPromptCacheText;
+      let sysContent = state._sysPromptCacheText;
+      // Inject open right-panel file as context
+      const _rpFile = rpState.activeFile;
+      if (_rpFile && _rpFile.content && !_rpFile.isImage) {
+        const _rpSnippet = _rpFile.content.length > 8000 ? _rpFile.content.slice(0, 8000) + '\n...[truncated]' : _rpFile.content;
+        sysContent += `\n\n---\nCurrently open file: ${_rpFile.path || 'untitled'}\n\`\`\`\n${_rpSnippet}\n\`\`\`\n---`;
+      }
       state._sysPromptLength = estimateTokens(sysContent);
       const apiMsgs = [{ role: 'system', content: sysContent }, ...messages.map(m => {
       if (m._images && m._images.length) {
@@ -11394,6 +11417,17 @@ Use git_diff to review changes before committing. git_diff without arguments sho
             : res.status === 503
             ? (state.backendType === 'llamacpp' ? '\n\nllama.cpp server is busy or unavailable. Wait a moment and try again.' : '\n\nLM Studio is busy or restarting. Wait a moment and try again.')
             : '';
+          // Auto-detect tool support error
+          if (res.status === 400 && (err.includes('does not support tools') || err.includes('tool'))) {
+            if (!state.toolsDisabled) {
+              state.toolsDisabled = true;
+              updateToolsBtn();
+              persistSettings();
+              showToast('Tools disabled automatically (model unsupported). Resending...', 'warn');
+              setTimeout(() => handleSend(), 300);
+              return;
+            }
+          }
           throw new Error(`API ${res.status}: ${err}${hints}`);
       }
 
@@ -12629,8 +12663,15 @@ Use git_diff to review changes before committing. git_diff without arguments sho
             state.model = sorted[0].id;
           }
 
+          // Restore pinned model
+          if (state.pinnedModel) {
+            const pinOpt = [...sel.options].find(o => o.value === state.pinnedModel);
+            if (pinOpt) { sel.value = state.pinnedModel; state.model = state.pinnedModel; }
+          }
+          updatePinBtn();
+
           sel.disabled = false;
-          
+
           invalidateSubAgentPromptCache();
           updateVisionUI();
           updateModelMeta();
@@ -12842,7 +12883,8 @@ Use git_diff to review changes before committing. git_diff without arguments sho
         await refreshModels(true);
         showToast('Model list refreshed', 'ok');
       } catch (e) {
-        showToast('LM Studio unreachable: ' + e.message.slice(0, 60), 'err');
+        const lbl = state.backendType === 'ollama' ? 'Ollama' : state.backendType === 'llamacpp' ? 'llama.cpp' : 'LM Studio';
+        showToast(lbl + ' unreachable: ' + e.message.slice(0, 60), 'err');
       } finally {
         btn.disabled = false;
         btn.querySelector('i').classList.remove('fa-spin');
@@ -12855,6 +12897,40 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       btn.disabled = true;
       await requestModelLoad(state.model);
       btn.disabled = false;
+    }
+
+    function toggleModelPin() {
+      const btn = document.getElementById('model-pin-btn');
+      if (state.pinnedModel === state.model) {
+        state.pinnedModel = null;
+        btn.classList.remove('active');
+        showToast('Model unpinned', 'ok');
+      } else {
+        state.pinnedModel = state.model;
+        btn.classList.add('active');
+        showToast(`Pinned: ${state.model}`, 'ok');
+      }
+      persistSettings();
+    }
+    function updatePinBtn() {
+      const btn = document.getElementById('model-pin-btn');
+      if (!btn) return;
+      if (state.pinnedModel && state.pinnedModel === state.model) {
+        btn.classList.add('active');
+      } else {
+        btn.classList.remove('active');
+      }
+    }
+    function toggleToolsDisabled() {
+      state.toolsDisabled = !state.toolsDisabled;
+      const btn = document.getElementById('tools-toggle-btn');
+      if (btn) btn.classList.toggle('disabled', state.toolsDisabled);
+      showToast(state.toolsDisabled ? 'Tool calling disabled' : 'Tool calling enabled', 'ok');
+      persistSettings();
+    }
+    function updateToolsBtn() {
+      const btn = document.getElementById('tools-toggle-btn');
+      if (btn) btn.classList.toggle('disabled', !!state.toolsDisabled);
     }
 
     /* ═══════════════ SMART SCROLL ═══════════════ */
@@ -15637,7 +15713,11 @@ Use git_diff to review changes before committing. git_diff without arguments sho
         if (s.qwenEnableThinking !== undefined) document.getElementById('s-qwen-enable-thinking').checked = s.qwenEnableThinking;
         if (s.qwenPreserveThinking !== undefined) document.getElementById('s-qwen-preserve-thinking').checked = s.qwenPreserveThinking;
         if (s.wsWarningDismissed !== undefined) _wsWarningDismissed = s.wsWarningDismissed;
-             
+        if (s.pinnedModel !== undefined) state.pinnedModel = s.pinnedModel;
+        if (s.toolsDisabled !== undefined) state.toolsDisabled = s.toolsDisabled;
+        updateToolsBtn();
+        updatePinBtn();
+
       } catch { }
       renderSysProfiles();
       // ADD THESE TWO LINES — sync loaded settings to UI and meter on startup:
@@ -15674,7 +15754,9 @@ Use git_diff to review changes before committing. git_diff without arguments sho
           wsWarningDismissed: _wsWarningDismissed,
           smartContextThreshold: state.smartContextThreshold,
           qwenEnableThinking: document.getElementById('s-qwen-enable-thinking')?.checked ?? true,
-          qwenPreserveThinking: document.getElementById('s-qwen-preserve-thinking')?.checked ?? true
+          qwenPreserveThinking: document.getElementById('s-qwen-preserve-thinking')?.checked ?? true,
+          pinnedModel: state.pinnedModel,
+          toolsDisabled: state.toolsDisabled
           // NO conversation data here anymore
         }));
       } catch { }
