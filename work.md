@@ -1,145 +1,224 @@
 # DualMind Dev — Что нужно доделать
 
-Скелет проекта готов: протоколы (Pydantic), SSH-бридж, инструменты (git, файлы, тесты), оркестратор и оба агента. Но ключевая бизнес-логика — заглушки. Ниже всё расписано по приоритету.
+Скелет проекта готов: протоколы (Pydantic), SSH-бридж, инструменты (git, файлы, тесты), оркестратор и оба агента. Ниже — всё расписано по приоритету.
 
 ---
 
-## Критично — без этого система не работает
+## ✅ Выполнено (merge-plan шаги 1–9, Критично 1–4)
 
-### 1. Junior не применяет изменения к файлам
-**Файл:** `agents/junior_agent.py:67` — `# TODO: wire LLM output to actual file edits via tool calls`
-
-Junior отправляет промпт в LLM, получает ответ в виде текста и… ничего не делает с файлами. Это главная дыра.
-
-Что нужно:
-- Определиться со стратегией: либо **structured tool calls** (LLM возвращает JSON с вызовами `write_file`/`read_file`), либо парсинг **diff-блоков** из ответа LLM и применение через `file_tools.write_file`.
-- Реализовать применение изменений в `execute_task()`.
-- После изменений вызывать `git_tools.create_branch()` и `git_tools.stage_changes()` (сейчас они импортированы, но не вызываются).
-
----
-
-### 2. Lead не парсит ответ LLM — всегда возвращает заглушку
-**Файл:** `agents/lead_agent.py:58` — `# TODO: parse LLM response into Task objects`
-**Файл:** `agents/lead_agent.py:97` — `# TODO: parse LLM response properly`
-
-`decompose_next_goal()` всегда возвращает один stub-таск независимо от цели.  
-`review_patch()` всегда возвращает `approved=True`.
-
-Что нужно:
-- Добавить парсинг JSON из ответа LLM (с fallback при невалидном JSON).
-- `decompose_next_goal()` должен возвращать реальный список `Task` из ответа LLM.
-- `review_patch()` должен парсить `{approved, feedback, requested_changes}` из ответа LLM.
-
----
-
-### 3. Нет способа добавить цель — система стартует с пустым списком
-**Файл:** `agents/lead_agent.py:24` — `self.goals: list[str] = []  # Populated by human or loaded from file`
-
-Оркестратор вызывает `lead.decompose_next_goal()`, который возвращает `[]`, и система крутится вхолостую.
-
-Что нужно (выбрать одно или оба):
-- **Вариант А**: читать цели из файла `queue/goals.txt` (одна цель — одна строка).
-- **Вариант Б**: интерактивный ввод в `main.py` — `input("Enter goal: ")` перед стартом.
-
----
-
-### 4. Очередь задач только в памяти — нет персистентности
-**Файл:** `core/orchestrator.py:21` — `self.task_queue: list[Task] = []`
-
-Задачи живут только в RAM. При рестарте всё теряется. В `queue/tasks/` есть `.gitkeep`, но нет папок `todo/`, `in_progress/`, `done/` и логики для работы с ними.
-
-Что нужно:
-- Создать папки `queue/tasks/todo/`, `queue/tasks/in_progress/`, `queue/tasks/done/`.
-- В оркестраторе: при создании таска — сохранять JSON-файл в `todo/`, при старте — перекладывать в `in_progress/`, при завершении — в `done/`.
-- При старте оркестратора — подбирать незавершённые задачи из `in_progress/` (recovery после краша).
-
----
-
-### 5. SSH в JuniorAgent подключается, но не используется
-**Файл:** `agents/junior_agent.py:26-31`
-
-`SSHBridge` создаётся в `__init__`, но `connect()` никогда не вызывается. `_chat()` обращается к `self.endpoint` напрямую через httpx — это работает только если порт 11434 открыт снаружи на машине Junior.
-
-Что нужно:
-- Открывать SSH-соединение при старте Junior (или через `__enter__`).
-- Использовать SSH-туннель для проброса порта Ollama: `SSHBridge` уже умеет `run()` — добавить метод `open_tunnel(remote_port, local_port)` через `paramiko.Transport`.
-- Либо явно задокументировать, что порт должен быть открыт (и закрыть `self.ssh` как неиспользуемый).
-
----
-
-### 6. Junior никогда не делает git commit
-**Файл:** `tools/git_tools.py` — есть `create_branch`, `stage_changes`, `get_diff`, но нет `commit_changes()`
-
-Junior должен зафиксировать изменения в feature-ветке (не в main). Без коммита `get_diff(branch)` ничего не покажет.
-
-Что нужно добавить в `git_tools.py`:
-```python
-def commit_changes(repo_path: str, message: str) -> str:
-    return _run(["git", "commit", "-m", message], cwd=repo_path)
-```
-И вызывать его в `junior_agent.execute_task()` после `stage_changes()`.
+| # | Что | Файл |
+|---|-----|------|
+| ✅ | `companion_client.py` — async httpx обёртка над companion server | `tools/companion_client.py` |
+| ✅ | `git_tools.py` — рефакторинг: async через companion, `commit_changes`, `get_log`, `current_branch` | `tools/git_tools.py` |
+| ✅ | `test_runner.py` — рефакторинг: `CheckResults`, async через companion | `tools/test_runner.py` |
+| ✅ | Companion server расширен: `/goal`, `/tasks`, `/approve/<id>`, `/reject/<id>`, `/agents/status` | `SlopLobster-companion.py` |
+| ✅ | Junior Agent: tool loop (read_file / write_file / execute), stage+commit, quality checks | `agents/junior_agent.py` |
+| ✅ | Lead Agent: `_parse_tasks`, `_parse_review`, `_research` через companion, `load_goals_from_file` | `agents/lead_agent.py` |
+| ✅ | HTML UI: DualMind вкладка, polling агентов, кнопки approve/reject, `.dm-*` CSS | `ui/SlopLobster.html` |
+| ✅ | `config.yaml.example` обновлён: companion_server, logging, UI-секция | `config.yaml.example` |
+| ✅ | `main.py`: `validate_config`, `setup_logging`, autostart companion, graceful shutdown | `main.py` |
+| ✅ | **Персистентная очередь** — recovery подхватывает TODO и IN_PROGRESS | `core/orchestrator.py` |
+| ✅ | **Human approval** — оркестратор поллит файлы-сентинели | `core/orchestrator.py` |
+| ✅ | **Retry-логика** — Junior получает фидбек Lead при повторе | `core/orchestrator.py` |
+| ✅ | **SSH-туннели** — автоматический проброс портов companion/model | `core/ssh_bridge.py`, `agents/junior_agent.py` |
 
 ---
 
 ## Важно — система работает, но неполноценно
 
-### 7. ProgressReport нигде не отправляется
-**Файл:** `core/protocol.py:42` — класс `ProgressReport` определён, но не используется нигде.
+### 5. `repository.path` из конфига нигде не используется
+`repository.path` задан в конфиге, но ни агент, ни оркестратор его не читают. Нужно решить, где он применяется (Lead-машина? Junior?), и прокинуть в `git_tools`.
 
-Junior должен слать промежуточные апдейты Lead во время выполнения задачи (особенно для долгих задач). Добавить отправку в `execute_task()` после каждого значимого шага.
-
----
-
-### 8. Retry-логика не реализована
-**Файл:** `config.yaml.example:24` — `max_retries: 2`, но в оркестраторе нет повторных попыток.
-
-При `review.approved == False` задача просто помечается `REJECTED`. Нужно:
-- Счётчик попыток в `Task` (или в оркестраторе).
-- Повтор `execute_task()` с фидбеком Lead в промпте Junior (не более `max_retries` раз).
-- Только после исчерпания попыток — `REJECTED`.
+### 6. `ProgressReport` нигде не отправляется
+`core/protocol.py` — класс определён, но Junior не шлёт промежуточные апдейты Lead. Добавить отправку через companion после каждого значимого шага в tool loop.
 
 ---
 
-### 9. Логирование в файл не работает
-**Файл:** `main.py:11`, `config.yaml.example:29` — `logging.file: ./logs/dualmind.log` есть в конфиге, но в `main.py` настроен только `StreamHandler`.
+## RAG через Qdrant
 
-Что нужно:
-- Читать `config["logging"]` в `main.py`.
-- Добавлять `FileHandler` если задан путь к лог-файлу.
-- Создавать директорию `logs/` если не существует.
+Векторная память для агентов: Junior читает файлы релевантные задаче без лишних tool-итераций, Lead не декомпозирует то, что уже было сделано.
 
----
+### Шаг R1. Инфраструктура — `tools/rag_store.py`
 
-### 10. Конфиг не валидируется
-**Файл:** `main.py:18` — `yaml.safe_load(f)` без валидации.
+Создать обёртку над `qdrant-client`:
 
-При отсутствии обязательного ключа (например, `ssh_key`) будет `KeyError` в глубине кода. Нужно добавить Pydantic-схему для конфига или хотя бы `assert`-проверки ключей при старте.
+```python
+class RAGStore:
+    async def ensure_collection(self, name, dim=1024)
+    async def upsert(self, companion, texts, payloads, collection)
+    async def search(self, companion, query, top_k=5, collection) -> list[dict]
+    async def delete_collection(self, name)
+```
 
----
-
-### 11. `repository.path` из конфига нигде не используется
-**Файл:** `config.yaml.example:18` — `repository.path` задан, но ни агент, ни оркестратор его не читают. `sandbox_dir` у Junior — отдельный параметр.
-
-Нужно решить: это путь к репозиторию на машине Lead, или на Junior, или оба? И прокинуть в `git_tools` правильный путь.
+- `embed()` делегируется `companion.embed(texts)` (companion уже имеет этот эндпоинт).
+- Коллекции: `codebase`, `task_history`, `error_patterns`.
+- Конфиг: добавить секцию `qdrant: {url: http://localhost:6333}` в `config.yaml.example`.
 
 ---
 
-### 12. Human approval блокирующий — но его нет
-**Файл:** `core/orchestrator.py:55` — `_notify_human()` просто печатает в консоль и возвращается. Оркестратор сразу продолжает к следующей задаче.
+### Шаг R2. Индексация кодовой базы
 
-Нужен механизм ожидания: либо `input("Approve? [y/n]: ")`, либо создание файла-флага `queue/tasks/done/<id>.approved`, который человек создаёт вручную.
+**Когда:** при старте `main.py`, после запуска companion.  
+**Что:** рекурсивно обойти `repository.path` по `*.py` файлам, разбить на чанки по функциям/классам (`ast_signatures` через companion), векторизовать.
+
+```python
+# tools/indexer.py
+async def index_codebase(rag: RAGStore, companion, repo_path: str) -> int:
+    """Returns number of chunks indexed."""
+```
+
+Payload каждого чанка: `{file, start_line, end_line, text, language}`.
 
 ---
 
-## Нет тестов для самого проекта
+### Шаг R3. RAG-контекст в промпт Junior
 
-**Файл:** `tools/test_runner.py` умеет запускать pytest, но в проекте нет ни одного `test_*.py`.
+В `JuniorAgent.execute_task()` перед `_build_messages()`:
+
+```python
+chunks = await rag.search(companion, task.description, top_k=5, collection="codebase")
+context = "\n\n".join(c["text"] for c in chunks)
+# добавить context в system prompt как "Relevant existing code:"
+```
+
+Эффект: Junior видит похожие функции до того, как начинает читать файлы через tool calls → меньше итераций, меньше дублирования.
+
+---
+
+### Шаг R4. Память задач для Lead
+
+После завершения каждой задачи (approve) — векторизовать и сохранить:
+```python
+payload = {
+    "task_id": task.id,
+    "title": task.title,
+    "description": task.description,
+    "outcome": "approved",
+    "files_changed": patch.files_changed,
+}
+await rag.upsert(companion, [task.description], [payload], collection="task_history")
+```
+
+В `LeadAgent.decompose_next_goal()` — искать похожие задачи и добавлять в промпт:
+```
+Similar past tasks:
+- "Add commit_changes to git_tools" → approved, changed tools/git_tools.py
+```
+
+---
+
+### Шаг R5. Память ошибок
+
+Если `patch.test_results.passed == False` → сохранить в `error_patterns`:
+```python
+payload = {
+    "task_id": task.id,
+    "error": checks.summary,
+    "file": patch.files_changed,
+}
+```
+
+Junior перед началом задачи ищет похожие ошибки → в промпт как "Known pitfalls:".
+
+---
+
+### Шаг R6. Переиндексация при изменениях
+
+- После `commit_changes` в Junior — обновить только изменённые файлы в коллекции `codebase`.
+- Не переиндексировать всё целиком при каждом запуске.
+- Хранить хэш файла в payload — сравнивать при старте, обновлять только изменившиеся.
+
+---
+
+## Telegram бот
+
+Управление системой и уведомления без HTML-интерфейса. Бот не трогает агентов напрямую — только companion HTTP API.
+
+### Шаг T1. Инфраструктура — `tg_bot/bot.py`
+
+- Библиотека: `aiogram 3.x` (async, современный API).
+- Конфиг: добавить секцию в `config.yaml.example`:
+
+```yaml
+telegram:
+  token: "BOT_TOKEN_HERE"
+  allowed_users: [123456789]   # Telegram user IDs, кто может управлять
+  companion_url: http://localhost:8765
+```
+
+- Запускать как отдельный процесс рядом с `main.py`, или интегрировать в asyncio event loop.
+- `allowed_users" — middleware, отклоняющий сообщения от неизвестных пользователей.
+
+---
+
+### Шаг T2. Команды управления
+
+| Команда | Действие |
+|---------|---------|
+| `/goal <текст>` | POST `/goal` → добавить цель в очередь |
+| `/status` | GET `/agents/status` → Lead/Junior статус + текущая задача |
+| `/tasks` | GET `/tasks` → список по статусам (todo/in_progress/done) |
+| `/approve <task_id>` | POST `/approve/<id>` → одобрить патч |
+| `/reject <task_id> <причина>` | POST `/reject/<id>` → отклонить с причиной |
+| `/log [N]` | Последние N строк из `logs/dualmind.log` (дефолт 20) |
+| `/help` | Список команд |
+
+---
+
+### Шаг T3. Inline кнопки для approve/reject
+
+Когда задача переходит в статус `pending_approval` — бот автоматически отправляет сообщение:
+
+```
+Task #a3f2 ready for review
+"Add commit_changes to git_tools"
+
+Tests: ✅  Lint: ✅  Diff: 42 lines
+
+[✅ Approve]  [❌ Reject]
+```
+
+- Кнопки через `InlineKeyboardMarkup` с `callback_data="approve:a3f2"`.
+- После нажатия — редактировать сообщение (не слать новое).
+- Companion server уведомляет бота: добавить POST `/notify` эндпоинт в companion, бот принимает его через `aiohttp` webhook или простой HTTP-сервер.
+
+---
+
+### Шаг T4. Push-уведомления
+
+Добавить в companion server эндпоинт `POST /notify`:
+
+```json
+{"event": "task_started", "task_id": "a3f2", "title": "..."}
+{"event": "task_ready", "task_id": "a3f2", "diff_lines": 42, "tests": true}
+{"event": "task_approved", "task_id": "a3f2"}
+{"event": "task_rejected", "task_id": "a3f2", "reason": "..."}
+{"event": "system_idle", "duration_minutes": 10}
+```
+
+Бот подписывается на `/notify` (long poll или callback URL). Оркестратор вызывает companion при каждом переходе статуса.
+
+---
+
+### Шаг T5. Мониторинг и алерты
+
+- Если Junior не шлёт прогресс более N минут (из конфига) → бот пишет "⚠️ Junior stuck on task #X".
+- Если система idle более 30 мин → "💤 DualMind idle — no goals queued".
+- `/log` команда показывает хвост лога с фильтром по уровню (ошибки красным).
+
+---
+
+## Тесты
+
+`tools/test_runner.py` умеет запускать pytest, но в проекте нет ни одного `test_*.py`.
 
 Минимум что нужно покрыть:
-- `test_protocol.py` — сериализация/десериализация всех Pydantic-моделей.
-- `test_git_tools.py` — `create_branch`, `get_diff`, `stage_changes` на временном репо.
-- `test_file_tools.py` — `read_file`, `write_file`, `unified_diff`.
-- `test_orchestrator.py` — логика approve/reject с замоканными агентами.
+- `tests/test_protocol.py` — сериализация/десериализация всех Pydantic-моделей.
+- `tests/test_git_tools.py` — `create_branch`, `get_diff`, `stage_changes`, `commit_changes` на временном репо с моком companion.
+- `tests/test_file_tools.py` — `_write_remote` / `_read_remote` через мок companion.
+- `tests/test_orchestrator.py` — approve/reject flow с замоканными агентами.
+- `tests/test_rag_store.py" — upsert/search против локального Qdrant (integration).
+- `tests/test_tg_bot.py" — обработчики команд с мок-companion (unit).
 
 ---
 
@@ -147,26 +226,40 @@ Junior должен слать промежуточные апдейты Lead в
 
 | # | Что | Где |
 |---|-----|-----|
-| 1 | Стриминг ответов LLM (`"stream": True`) | `lead_agent._chat()`, `junior_agent._chat()` |
-| 2 | Обрезка промпта при большом диффе (сейчас `patch.diff[:3000]` — хардкод) | `lead_agent.review_patch()` |
-| 3 | Загрузка нескольких целей из файла за один запуск | `agents/lead_agent.py` |
-| 4 | `ruff format` в дополнение к `ruff check` | `tools/test_runner.py` |
-| 5 | Graceful shutdown по Ctrl+C в главном цикле | `main.py`, `core/orchestrator.py` |
-| 6 | `.gitignore` расширить: `logs/`, `config.yaml`, `queue/tasks/done/`, `queue/tasks/in_progress/` | `.gitignore` |
+| 1 | Стриминг ответов LLM (`"stream": True`) | `lead_agent._chat()`, `junior_agent._chat_with_tools()` |
+| 2 | Обрезка промпта при большом диффе (сейчас `patch.diff[:4000]`) | `lead_agent.review_patch()` |
+| 3 | `ruff format` в дополнение к `ruff check` | `tools/test_runner.py` |
+| 4 | `.gitignore` расширить: `logs/`, `config.yaml`, `queue/tasks/done/`, `queue/tasks/in_progress/` | `.gitignore` |
+| 5 | Веб-хук режим для Telegram бота вместо long polling | `tg_bot/bot.py` |
+| 6 | Дашборд скорости: сколько задач/час, среднее время итерации | `ui/SlopLobster.html` |
 
 ---
 
 ## Порядок работы (рекомендуемая очерёдность)
 
 ```
-1. Механизм ввода целей (#3)          ← без него не запустить
-2. Парсинг LLM-ответов (#2)           ← без него Lead всегда stub
-3. Применение изменений к файлам (#1) ← без него Junior ничего не делает
-4. git commit в Junior (#6)           ← без него diff пустой
-5. Персистентная очередь (#4)         ← надёжность
-6. Human approval wait (#12)          ← безопасность
-7. Retry-логика (#8)
-8. Логирование в файл (#9)
-9. Валидация конфига (#10)
-10. Тесты (#13)
+── Стабилизация ядра ──────────────────────────────────────────────────
+ 1. Персистентная очередь в оркестраторе (#1)   ← DONE
+ 2. Human approval wait (#2)                    ← DONE
+ 3. Retry-логика (#3)                           ← DONE
+ 4. SSH-туннель (#4)                            ← DONE
+
+── RAG ────────────────────────────────────────────────────────────────
+ 5. R1: RAGStore + Qdrant infra                 ← основа для всего RAG
+ 6. R2: индексация кодовой базы                 ← Junior читает меньше файлов
+ 7. R3: RAG-контекст в промпт Junior            ← меньше tool-итераций
+ 8. R4: память задач для Lead                   ← не повторять выполненное
+ 9. R5: память ошибок                           ← не наступать на те же грабли
+10. R6: инкрементная переиндексация             ← производительность
+
+── Telegram ───────────────────────────────────────────────────────────
+11. T1: инфраструктура бота, allowed_users      ← скелет
+12. T2: команды /goal /status /tasks /log       ← минимальный полезный бот
+13. T3: inline кнопки approve/reject            ← удобный human-in-the-loop
+14. T4: push-уведомления от companion           ← не надо поллить статус руками
+15. T5: мониторинг и алерты о зависании        ← опциональный, но полезный
+
+── Тесты ──────────────────────────────────────────────────────────────
+16. test_protocol, test_git_tools, test_orchestrator
+17. test_rag_store, test_tg_bot
 ```
