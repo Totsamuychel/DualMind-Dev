@@ -283,7 +283,14 @@ class LeadAgent:
         )
         prompt = "\n".join(prompt_parts)
 
-        raw = await self._chat(prompt, system=system)
+        try:
+            raw = await self._chat(prompt, system=system)
+        except Exception as exc:
+            # Put the goal back so it isn't silently dropped on LLM failure.
+            logger.warning("LLM call failed for goal %r — requeueing: %s", goal, exc)
+            self.goals.insert(0, goal)
+            return []
+
         logger.debug("Decomposition raw: %s", raw[:300])
         return self._parse_tasks(raw, goal)
 

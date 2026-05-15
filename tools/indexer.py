@@ -367,8 +367,10 @@ class CodebaseIndexer:
         total = 0
         files_indexed = 0
         files_skipped = 0
+        current_rels: set[str] = set()
 
         for path, lang in self._walk_files():
+            current_rels.add(str(path.relative_to(self.repo)).replace("\\", "/"))
             n = await self._index_file(path, lang, hash_cache)
             if n:
                 total += n
@@ -376,11 +378,6 @@ class CodebaseIndexer:
             else:
                 files_skipped += 1
 
-        # Purge cache entries whose files no longer exist.
-        current_rels = {
-            str(p.relative_to(self.repo)).replace("\\", "/")
-            for p, _ in self._walk_files()
-        }
         stale = [k for k in hash_cache if k not in current_rels]
         for rel in stale:
             await self.rag.delete_by_filter(COLLECTION_CODEBASE, "file", rel)

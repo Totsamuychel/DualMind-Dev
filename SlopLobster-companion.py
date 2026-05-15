@@ -834,7 +834,6 @@ def _close_browser():
     _pw_console = []
     _pw_launch_time = None
 
-@staticmethod
 def _browser_error_hint():
     if not HAS_PLAYWRIGHT:
         return "Playwright not installed. Run: pip install playwright && playwright install chromium"
@@ -843,7 +842,7 @@ def _browser_error_hint():
         compute_driver_executable()
         return "Playwright installed but browser binary missing. Run: playwright install chromium"
     except Exception:
-        return "Playwright import works but browser launch failed. Check: playwright install chromium"    
+        return "Playwright import works but browser launch failed. Check: playwright install chromium"
 
 def _ensure_page():
     global _pw, _pw_browser, _pw_page, _pw_console, _pw_launch_time
@@ -1033,8 +1032,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # GET /conversations/<id> — load full conversation
             try:
                 conv_id = self.path.removeprefix("/conversations/").strip("/")
-                if not conv_id:
-                    return self.send_json(400, {"error": "id missing"})
+                if not conv_id or "/" in conv_id or "\\" in conv_id or ".." in conv_id:
+                    return self.send_json(400, {"error": "invalid id"})
                 _conv_ensure_dir()
                 f = _CONV_DIR / f"{conv_id}.json"
                 if not f.exists():
@@ -1574,12 +1573,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             try:
                 body = self.read_body()
                 conv_id = str(body.get("id", "")).strip()
-                if not conv_id:
-                    return self.send_json(400, {"error": "id required"})
+                if not conv_id or "/" in conv_id or "\\" in conv_id or ".." in conv_id:
+                    return self.send_json(400, {"error": "invalid id"})
                 _conv_ensure_dir()
                 f = _CONV_DIR / f"{conv_id}.json"
+                tmp = f.with_suffix(".tmp")
                 with _CONV_LOCK:
-                    f.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+                    tmp.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+                    tmp.replace(f)
                 self.send_json(200, {"ok": True, "id": conv_id})
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
@@ -1587,6 +1588,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path.startswith("/conversations/"):
             # POST /conversations/<id>/delete — delete a conversation
             conv_id = path.removeprefix("/conversations/").strip("/").removesuffix("/delete")
+            if not conv_id or "/" in conv_id or "\\" in conv_id or ".." in conv_id:
+                return self.send_json(400, {"error": "invalid id"})
             try:
                 _conv_ensure_dir()
                 f = _CONV_DIR / f"{conv_id}.json"

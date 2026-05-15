@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import logging
+import shlex
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -235,7 +236,7 @@ class JuniorAgent:
         return str(sandbox / p)
 
     async def _read_remote(self, abs_path: str) -> str:
-        result = await self.companion.execute(f"cat '{abs_path}'")
+        result = await self.companion.execute(f"cat {shlex.quote(abs_path)}")
         if not result.ok:
             raise FileNotFoundError(f"{abs_path}: {result.stderr.strip()}")
         return result.stdout
@@ -247,10 +248,11 @@ class JuniorAgent:
         arbitrary file content (newlines, quotes, backslashes, etc.).
         """
         b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
-        parent = str(Path(abs_path).parent)
-        await self.companion.execute(f"mkdir -p '{parent}'")
+        parent = shlex.quote(str(Path(abs_path).parent))
+        quoted_path = shlex.quote(abs_path)
+        await self.companion.execute(f"mkdir -p {parent}")
         result = await self.companion.execute(
-            f"echo '{b64}' | base64 -d > '{abs_path}'"
+            f"echo '{b64}' | base64 -d > {quoted_path}"
         )
         if not result.ok:
             raise RuntimeError(f"write_file {abs_path}: {result.stderr.strip()}")
@@ -547,10 +549,14 @@ class JuniorAgent:
                 self.companion, self.sandbox_dir, task.branch
             )
         except RuntimeError:
-            # Branch already exists (retry). Just check it out.
-            await self.companion.execute(
-                f"git checkout '{task.branch}'", cwd=self.sandbox_dir
+            # Branch already exists (retry). Check it out and raise if that fails.
+            result = await self.companion.execute(
+                f"git checkout {shlex.quote(task.branch)}", cwd=self.sandbox_dir
             )
+            if not result.ok:
+                raise RuntimeError(
+                    f"git checkout {task.branch!r}: {result.stderr.strip()}"
+                )
 
         # ── 2. Tool loop ─────────────────────────────────────────────────────
         rag_context, error_context = await asyncio.gather(
@@ -593,7 +599,11 @@ class JuniorAgent:
                 if name == "write_file" and "path" in args:
                     files_written.append(args["path"])
 
-                messages.append({"role": "tool", "content": result_text})
+                tool_msg: dict = {"role": "tool", "content": result_text}
+                call_id = call.get("id")
+                if call_id:
+                    tool_msg["tool_call_id"] = call_id
+                messages.append(tool_msg)
 
             # Publish progress so orchestrator and UI can follow along.
             await self.companion.dm_update_agents_status(

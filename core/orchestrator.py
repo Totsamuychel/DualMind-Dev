@@ -133,7 +133,15 @@ class Orchestrator:
                 if task.status not in (TaskStatus.TODO, TaskStatus.IN_PROGRESS):
                     continue
 
-                await self._execute_task_with_retries(task)
+                try:
+                    await self._execute_task_with_retries(task)
+                except Exception as exc:
+                    logger.error(
+                        "Unhandled error executing task [%s] '%s': %s — skipping",
+                        task.id, task.title, exc, exc_info=True,
+                    )
+                    task.status = TaskStatus.REJECTED
+                    await self._save_task(task)
 
             await asyncio.sleep(5)
 
