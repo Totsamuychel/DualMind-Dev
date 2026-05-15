@@ -1,6 +1,6 @@
 #!/usr/bin/env python
-"""SlopLobster Companion Server v1.4 — Shell + Git + Web Search for SlopLobster Agent."""
-import http.server, subprocess, json, os, sys, signal, platform, re, urllib.request, urllib.parse, urllib.error, shutil, threading, time
+"""SlopLobster Companion Server v1.5 — Shell + Git + Web Search + SQLite DB."""
+import http.server, subprocess, json, os, sys, signal, platform, re, urllib.request, urllib.parse, urllib.error, shutil, threading, time, sqlite3, mimetypes
 from collections import deque
 from html.parser import HTMLParser
 from pathlib import Path
@@ -35,12 +35,174 @@ _DM_NOTIFY_QUEUE: deque = deque(maxlen=200)  # cap to prevent unbounded growth
 
 _DM_STATUSES = ("todo", "in_progress", "done")
 
-# ── Conversation persistence ──────────────────────────────────────────────────
+# ── Conversation persistence (legacy file paths — kept for migration) ─────────
 _CONV_DIR   = Path("data/conversations")
 _CONV_LOCK  = threading.Lock()
 
 def _conv_ensure_dir():
     _CONV_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ── SQLite database ───────────────────────────────────────────────────────────
+_DB_PATH = Path("data/dualmind.db")
+_DB_LOCK = threading.Lock()
+
+
+def _db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(_DB_PATH), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
+def _db_init() -> None:
+    """Create DB tables and migrate any existing JSON files (one-time)."""
+    _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _DB_LOCK:
+        conn = _db_connect()
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS conversations (
+                id            TEXT PRIMARY KEY,
+                title         TEXT    DEFAULT '',
+                updated       TEXT    DEFAULT '',
+                message_count INTEGER DEFAULT 0,
+                data          TEXT    NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS tasks (
+                id      TEXT PRIMARY KEY,
+                status  TEXT NOT NULL DEFAULT 'todo',
+                title   TEXT DEFAULT '',
+                data    TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+        """)
+        conn.commit()
+        conn.close()
+    _db_migrate_files()
+
+
+def _db_migrate_files() -> None:
+    """Import legacy JSON files into SQLite on first run, then rename them."""
+    _conv_ensure_dir()
+    for f in list(_CONV_DIR.glob("*.json")):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            _db_upsert_conversation(data.get("id", f.stem), data)
+            f.rename(f.with_suffix(".json.migrated"))
+        except Exception:
+            pass
+    _dm_ensure_dirs()
+    for status in _DM_STATUSES:
+        for f in list((_DM_QUEUE / status).glob("*.json")):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                task_id = data.get("id", f.stem)
+                _db_upsert_task(task_id, status, data.get("title", ""), data)
+                f.rename(f.with_suffix(".json.migrated"))
+            except Exception:
+                pass
+
+
+# ── SQLite conversation helpers ───────────────────────────────────────────────
+
+def _db_upsert_conversation(conv_id: str, data: dict) -> None:
+    with _DB_LOCK:
+        conn = _db_connect()
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO conversations(id,title,updated,message_count,data)"
+                " VALUES(?,?,?,?,?)",
+                (conv_id, data.get("title", ""), data.get("updated", ""),
+                 len(data.get("messages", [])),
+                 json.dumps(data, ensure_ascii=False)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _db_delete_conversation(conv_id: str) -> None:
+    with _DB_LOCK:
+        conn = _db_connect()
+        try:
+            conn.execute("DELETE FROM conversations WHERE id=?", (conv_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _db_get_conversation(conv_id: str):
+    conn = _db_connect()
+    try:
+        row = conn.execute(
+            "SELECT data FROM conversations WHERE id=?", (conv_id,)
+        ).fetchone()
+        return json.loads(row["data"]) if row else None
+    finally:
+        conn.close()
+
+
+def _db_list_conversations() -> list:
+    conn = _db_connect()
+    try:
+        rows = conn.execute(
+            "SELECT id,title,updated,message_count FROM conversations"
+            " ORDER BY updated DESC"
+        ).fetchall()
+        return [
+            {"id": r["id"], "title": r["title"], "updated": r["updated"],
+             "message_count": r["message_count"]}
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+# ── SQLite task helpers ───────────────────────────────────────────────────────
+
+def _db_upsert_task(task_id: str, status: str, title: str, data: dict) -> None:
+    with _DB_LOCK:
+        conn = _db_connect()
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO tasks(id,status,title,data) VALUES(?,?,?,?)",
+                (task_id, status, title, json.dumps(data, ensure_ascii=False)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _db_get_task(task_id: str):
+    conn = _db_connect()
+    try:
+        row = conn.execute(
+            "SELECT status,data FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        if not row:
+            return None
+        d = json.loads(row["data"])
+        d["status"] = row["status"]
+        return d
+    finally:
+        conn.close()
+
+
+def _db_load_tasks() -> dict:
+    """Return {todo:[...], in_progress:[...], done:[...]} — matches legacy file API."""
+    conn = _db_connect()
+    try:
+        result: dict = {"todo": [], "in_progress": [], "done": []}
+        rows = conn.execute("SELECT status,data FROM tasks ORDER BY rowid").fetchall()
+        for r in rows:
+            d = json.loads(r["data"])
+            d["status"] = r["status"]
+            bucket = r["status"] if r["status"] in result else "done"
+            result[bucket].append(d)
+        return result
+    finally:
+        conn.close()
 
 
 def _dm_ensure_dirs():
@@ -934,6 +1096,27 @@ def _check_dev_ready(port, timeout=3):
     except: return False    
 
 
+def _serve_static(handler, file_path: Path) -> None:
+    """Send a static file with appropriate Content-Type, or 404 if missing."""
+    if not file_path.exists() or not file_path.is_file():
+        handler.send_response(404)
+        handler._cors()
+        handler.send_header("Content-Type", "text/plain")
+        handler.end_headers()
+        handler.wfile.write(b"Not found")
+        return
+    mime, _ = mimetypes.guess_type(str(file_path))
+    if not mime:
+        mime = "application/octet-stream"
+    data = file_path.read_bytes()
+    handler.send_response(200)
+    handler._cors()
+    handler.send_header("Content-Type", mime)
+    handler.send_header("Content-Length", str(len(data)))
+    handler.end_headers()
+    handler.wfile.write(data)
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def handle_one_request(self):
         try:
@@ -947,6 +1130,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        # ── Static file serving ───────────────────────────────────────────────
+        if self.path in ("/", "/index.html"):
+            _serve_static(self, Path("ui/SlopLobster.html"))
+            return
+        if self.path.startswith("/ui/"):
+            rel = self.path[len("/ui/"):].lstrip("/").split("?")[0]
+            # Reject any path traversal
+            if ".." in rel or rel.startswith("/"):
+                self.send_json(400, {"error": "bad path"})
+                return
+            _serve_static(self, Path("ui") / rel)
+            return
+
         if self.path in ("/status", "/ping"):
             self.send_json(200, {
                 "status": "ok",
@@ -966,7 +1162,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         elif self.path == "/tasks":
             try:
-                self.send_json(200, _dm_load_tasks())
+                self.send_json(200, _db_load_tasks())
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
 
@@ -988,57 +1184,43 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"events": events, "count": len(events)})
 
         elif self.path.startswith("/task/") and self.path.endswith("/approval"):
-            # GET /task/<id>/approval — check human-approval sentinel files.
+            # GET /task/<id>/approval — check task status in DB.
             # Returns {"status": "approved"|"rejected"|"pending", "reason": "..."}
             try:
                 task_id = self.path[len("/task/"):-len("/approval")].strip("/")
                 if not task_id:
                     return self.send_json(400, {"error": "task_id missing"})
-                _dm_ensure_dirs()
-                approved = _DM_QUEUE / "done" / f"{task_id}.approved"
-                rejected = _DM_QUEUE / "done" / f"{task_id}.rejected"
-                if approved.exists():
+                task = _db_get_task(task_id)
+                if task is None:
+                    return self.send_json(200, {"status": "pending", "reason": ""})
+                status = task.get("status", "")
+                if status == "done":
                     self.send_json(200, {"status": "approved", "reason": ""})
-                elif rejected.exists():
-                    reason = rejected.read_text(encoding="utf-8", errors="replace").strip()
+                elif status == "rejected":
+                    reason = task.get("reject_reason", "")
                     self.send_json(200, {"status": "rejected", "reason": reason})
                 else:
                     self.send_json(200, {"status": "pending", "reason": ""})
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
 
-        # ── Conversation persistence ──────────────────────────────────────────
+        # ── Conversation persistence (SQLite) ────────────────────────────────
         elif self.path == "/conversations":
-            # GET /conversations — list all saved conversations (id, title, updated)
             try:
-                _conv_ensure_dir()
-                convs = []
-                for f in sorted(_CONV_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
-                    try:
-                        data = json.loads(f.read_text(encoding="utf-8"))
-                        convs.append({
-                            "id": data.get("id", f.stem),
-                            "title": data.get("title", "Untitled"),
-                            "updated": data.get("updated", ""),
-                            "message_count": len(data.get("messages", [])),
-                        })
-                    except Exception:
-                        pass
-                self.send_json(200, {"conversations": convs, "count": len(convs)})
+                self.send_json(200, {"conversations": _db_list_conversations()})
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
 
         elif self.path.startswith("/conversations/"):
-            # GET /conversations/<id> — load full conversation
+            # GET /conversations/<id> — load full conversation from DB
             try:
                 conv_id = self.path.removeprefix("/conversations/").strip("/")
                 if not conv_id or "/" in conv_id or "\\" in conv_id or ".." in conv_id:
                     return self.send_json(400, {"error": "invalid id"})
-                _conv_ensure_dir()
-                f = _CONV_DIR / f"{conv_id}.json"
-                if not f.exists():
+                data = _db_get_conversation(conv_id)
+                if data is None:
                     return self.send_json(404, {"error": "not found"})
-                self.send_json(200, json.loads(f.read_text(encoding="utf-8")))
+                self.send_json(200, data)
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
 
@@ -1442,67 +1624,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(500, {"error": str(e)})
 
         elif path.startswith("/approve/"):
-            # Human approves a task patch.
-            # Immediately moves the task JSON to done/ with status="done" so
-            # GET /tasks reflects the change right away (no orchestrator poll lag).
-            # Also creates the sentinel file so the orchestrator's polling loop
-            # can still detect the outcome.
+            # Human approves a task — update DB status to "done".
             try:
                 task_id = path.removeprefix("/approve/").strip("/")
                 if not task_id:
                     return self.send_json(400, {"error": "task_id missing"})
-                task_file = _dm_find_task_file(task_id)
-                if task_file is None:
+                task_data = _db_get_task(task_id)
+                if task_data is None:
                     return self.send_json(404, {"error": f"task {task_id!r} not found"})
-                with _DM_WRITE_LOCK:
-                    _dm_ensure_dirs()
-                    # Update task JSON: set status=done, move to done/
-                    try:
-                        task_data = json.loads(task_file.read_text(encoding="utf-8"))
-                    except Exception:
-                        task_data = {"id": task_id}
-                    task_data["status"] = "done"
-                    new_path = _DM_QUEUE / "done" / f"{task_id}.json"
-                    new_path.write_text(json.dumps(task_data, ensure_ascii=False, indent=2), encoding="utf-8")
-                    if task_file != new_path:
-                        try: task_file.unlink()
-                        except OSError: pass
-                    # Sentinel for orchestrator polling compatibility
-                    sentinel = _DM_QUEUE / "done" / f"{task_id}.approved"
-                    sentinel.touch()
+                task_data["status"] = "done"
+                _db_upsert_task(task_id, "done", task_data.get("title", ""), task_data)
                 self.send_json(200, {"ok": True, "task_id": task_id, "status": "done"})
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
 
         elif path.startswith("/reject/"):
-            # Human rejects a task patch.
-            # Immediately moves the task JSON to done/ with status="rejected".
+            # Human rejects a task — update DB status to "rejected" + store reason.
             try:
                 task_id = path.removeprefix("/reject/").strip("/")
                 if not task_id:
                     return self.send_json(400, {"error": "task_id missing"})
-                task_file = _dm_find_task_file(task_id)
-                if task_file is None:
+                task_data = _db_get_task(task_id)
+                if task_data is None:
                     return self.send_json(404, {"error": f"task {task_id!r} not found"})
                 body = self.read_body()
                 reason = body.get("reason", "").strip()
-                with _DM_WRITE_LOCK:
-                    _dm_ensure_dirs()
-                    try:
-                        task_data = json.loads(task_file.read_text(encoding="utf-8"))
-                    except Exception:
-                        task_data = {"id": task_id}
-                    task_data["status"] = "rejected"
-                    if reason:
-                        task_data["reject_reason"] = reason
-                    new_path = _DM_QUEUE / "done" / f"{task_id}.json"
-                    new_path.write_text(json.dumps(task_data, ensure_ascii=False, indent=2), encoding="utf-8")
-                    if task_file != new_path:
-                        try: task_file.unlink()
-                        except OSError: pass
-                    # Sentinel for orchestrator polling compatibility
-                    sentinel = _DM_QUEUE / "done" / f"{task_id}.rejected"
-                    sentinel.write_text(reason, encoding="utf-8")
+                task_data["status"] = "rejected"
+                if reason:
+                    task_data["reject_reason"] = reason
+                _db_upsert_task(task_id, "rejected", task_data.get("title", ""), task_data)
                 self.send_json(200, {"ok": True, "task_id": task_id, "status": "rejected", "reason": reason})
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
@@ -1523,32 +1673,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(500, {"error": str(e)})
 
         elif path == "/task":
-            # Upsert a task JSON.  Creates the file in the correct status folder;
-            # moves it when the status field changes.
-            # Body: full Task dict (must include "id" and "status").
+            # Upsert a task into SQLite. Body: full Task dict (must include "id").
             try:
                 body = self.read_body()
                 task_id = str(body.get("id", "")).strip()
                 status  = str(body.get("status", "todo")).strip()
+                title   = str(body.get("title", "")).strip()
                 if not task_id:
                     return self.send_json(400, {"error": "id is required"})
-                # rejected tasks live in done/
-                folder = "done" if status in ("done", "rejected") else \
-                         ("in_progress" if status == "in_progress" else "todo")
-                _dm_ensure_dirs()
-                with _DM_WRITE_LOCK:
-                    old_file = _dm_find_task_file(task_id)
-                    if old_file is not None and old_file.parent.name != folder:
-                        try:
-                            old_file.unlink()
-                        except OSError:
-                            pass
-                    new_path = _DM_QUEUE / folder / f"{task_id}.json"
-                    new_path.write_text(
-                        json.dumps(body, ensure_ascii=False, indent=2),
-                        encoding="utf-8",
-                    )
-                self.send_json(200, {"ok": True, "task_id": task_id, "path": str(new_path)})
+                _db_upsert_task(task_id, status, title, body)
+                self.send_json(200, {"ok": True, "task_id": task_id, "status": status})
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
 
@@ -1567,35 +1701,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
 
-        # ── Conversation save/delete ──────────────────────────────────────────
+        # ── Conversation save/delete (SQLite) ────────────────────────────────
         elif path == "/conversations":
-            # POST /conversations — upsert a conversation (body = full conversation JSON)
+            # POST /conversations — upsert a conversation into SQLite
             try:
                 body = self.read_body()
                 conv_id = str(body.get("id", "")).strip()
                 if not conv_id or "/" in conv_id or "\\" in conv_id or ".." in conv_id:
                     return self.send_json(400, {"error": "invalid id"})
-                _conv_ensure_dir()
-                f = _CONV_DIR / f"{conv_id}.json"
-                tmp = f.with_suffix(".tmp")
-                with _CONV_LOCK:
-                    tmp.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
-                    tmp.replace(f)
+                _db_upsert_conversation(conv_id, body)
                 self.send_json(200, {"ok": True, "id": conv_id})
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
 
         elif path.startswith("/conversations/"):
-            # POST /conversations/<id>/delete — delete a conversation
+            # POST /conversations/<id>/delete — delete from SQLite
             conv_id = path.removeprefix("/conversations/").strip("/").removesuffix("/delete")
             if not conv_id or "/" in conv_id or "\\" in conv_id or ".." in conv_id:
                 return self.send_json(400, {"error": "invalid id"})
             try:
-                _conv_ensure_dir()
-                f = _CONV_DIR / f"{conv_id}.json"
-                with _CONV_LOCK:
-                    if f.exists():
-                        f.unlink()
+                _db_delete_conversation(conv_id)
                 self.send_json(200, {"ok": True, "id": conv_id})
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
@@ -1629,10 +1754,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else PORT
+    _db_init()
     server = http.server.HTTPServer(("127.0.0.1", port), Handler)
     server.socket.settimeout(None)
     server.timeout = None
-    print("\n  SlopLobster Companion v1.4  |  http://127.0.0.1:" + str(port) + "  |  " + platform.system() + "  |  Ctrl+C to stop\n")
+    url = f"http://127.0.0.1:{port}"
+    print(f"\n  DualMind Companion v1.5  |  {url}  |  {platform.system()}  |  Ctrl+C to stop")
+    print(f"  Open in browser: {url}/\n")
     sys.stdout.flush()
     try:
         server.serve_forever()

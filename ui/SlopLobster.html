@@ -15230,6 +15230,53 @@ Use git_diff to review changes before committing. git_diff without arguments sho
         if (c?._originalTask) state.originalTask = c._originalTask;
       }
       renderConvList();
+      // When served from companion, sync with server DB in background
+      if (window.location.protocol !== 'file:') {
+        _syncConvsFromServer();
+      }
+    }
+
+    async function _syncConvsFromServer() {
+      // 1. Upload any local conversations that haven't been saved to server yet
+      for (const conv of state.conversations) {
+        if (conv.messages && conv.messages.length > 0) {
+          try {
+            const payload = {
+              id: conv.id, title: conv.title || 'Untitled',
+              created: conv.created, updated: conv.updated,
+              messages: (conv.messages || []).map(m => {
+                const clean = { ...m };
+                delete clean._diff; delete clean._searchData; delete clean._images;
+                return clean;
+              }),
+            };
+            await fetch(`${state.compUrl}/conversations`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+            });
+          } catch { /* skip silent */ }
+        }
+      }
+      // 2. Fetch server list and add any server-only conversations to the list
+      try {
+        const res = await fetch(`${state.compUrl}/conversations`, { signal: AbortSignal.timeout(5000) });
+        if (!res.ok) return;
+        const data = await res.json();
+        const localIds = new Set(state.conversations.map(c => c.id));
+        let added = 0;
+        for (const sc of data.conversations || []) {
+          if (!localIds.has(sc.id)) {
+            state.conversations.push({
+              id: sc.id, title: sc.title || 'Untitled',
+              updated: sc.updated, created: sc.updated,
+              messages: [], _serverOnly: true,
+            });
+            added++;
+          }
+        }
+        if (added > 0) renderConvList();
+      } catch { /* companion not reachable yet, will retry on next poll */ }
     }
 
     function saveConversations() {
@@ -15286,7 +15333,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
     }
 
     function _saveConvToServer(conv) {
-      if (!state.compConnected) return;
+      if (!state.compConnected && window.location.protocol === 'file:') return;
       try {
         const payload = {
           id: conv.id,
@@ -15377,19 +15424,35 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       const c = state.conversations.find(c => c.id === id);
       if (!c) return;
 
-      // If conversation was loaded from cache only (no messages), try loading from workspace
-      if (c.messages.length === 0 && !c._loadError && state.dirHandle) {
-        try {
-          await ensureConvDir();
-          const slopDir = await state.dirHandle.getDirectoryHandle('.sloplobster');
-          const convDir = await slopDir.getDirectoryHandle('conversations');
-          const convFile = await convDir.getFileHandle(id + '.json');
-          const data = JSON.parse(await (await convFile.getFile()).text());
-          if (data.messages && data.messages.length) {
-            c.messages = data.messages;
-            c._originalTask = data._originalTask || null;
-          }
-        } catch { /* not found, stay empty */ }
+      // If conversation has no local messages, try loading from server first, then workspace
+      if (c.messages.length === 0 && !c._loadError) {
+        if (window.location.protocol !== 'file:' || c._serverOnly) {
+          try {
+            const res = await fetch(`${state.compUrl}/conversations/${encodeURIComponent(c.id)}`,
+              { signal: AbortSignal.timeout(5000) });
+            if (res.ok) {
+              const data = await res.json();
+              if (data.messages && data.messages.length) {
+                c.messages = data.messages;
+                c._originalTask = data._originalTask || null;
+                delete c._serverOnly;
+              }
+            }
+          } catch { /* fall through to workspace */ }
+        }
+        if (c.messages.length === 0 && state.dirHandle) {
+          try {
+            await ensureConvDir();
+            const slopDir = await state.dirHandle.getDirectoryHandle('.sloplobster');
+            const convDir = await slopDir.getDirectoryHandle('conversations');
+            const convFile = await convDir.getFileHandle(id + '.json');
+            const data = JSON.parse(await (await convFile.getFile()).text());
+            if (data.messages && data.messages.length) {
+              c.messages = data.messages;
+              c._originalTask = data._originalTask || null;
+            }
+          } catch { /* not found, stay empty */ }
+        }
       }
 
       state.activeConvId = id;
@@ -17713,6 +17776,15 @@ Format:
     /* ═══════════════ INIT ═══════════════ */
     function init() {
       loadSettings();
+      // When served from the companion server, auto-point compUrl at ourselves.
+      if (window.location.protocol === 'http:' || window.location.protocol === 'https:') {
+        const autoUrl = window.location.origin;
+        if (state.compUrl !== autoUrl) {
+          state.compUrl = autoUrl;
+          const el = document.getElementById('s-comp-url');
+          if (el) el.value = autoUrl;
+        }
+      }
       loadConversations();
       renderWelcomeGrid();
 
